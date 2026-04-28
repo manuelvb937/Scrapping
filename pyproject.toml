@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "social-listening-pipeline"
+version = "0.1.0"
+description = "Scaffold for a social listening pipeline for clustering and topic extraction"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+social-listening = "social_listening_pipeline.cli:main"
+yahoo-realtime-scrape = "collector.yahoo_realtime:main"
+preprocess-posts = "preprocessing.pipeline:main"
+run-analysis = "analysis.pipeline:main"
+generate-report = "reporting.generator:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
