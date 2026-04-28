@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Scaffold for a social listening pipeline for clustering and topic extraction"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "selenium>=4.20.0",
+]
 
 [project.scripts]
 social-listening = "social_listening_pipeline.cli:main"

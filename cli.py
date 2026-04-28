@@ -19,7 +19,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from analysis.pipeline import run_analysis
-from collector.yahoo_realtime import scrape_yahoo_realtime
+from collector.yahoo_realtime import scrape_yahoo_realtime, smoke_test_chrome_driver
 from preprocessing.pipeline import preprocess_raw_file
 from reporting.generator import generate_reports
 
@@ -30,6 +30,13 @@ def latest_file(directory: Path, pattern: str) -> Path | None:
 
 
 def command_scrape(args: argparse.Namespace) -> None:
+    if args.check_chrome:
+        ok, message = smoke_test_chrome_driver()
+        if ok:
+            print(message)
+            return
+        raise RuntimeError(message)
+
     scrape_yahoo_realtime(
         keywords=args.keywords,
         max_posts=args.max_posts,
@@ -85,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     scrape.add_argument("--keywords", nargs="+", default=["openai"], help="Keywords to scrape")
     scrape.add_argument("--max-posts", type=int, default=100)
     scrape.add_argument("--max-scrolls", type=int, default=10)
+    scrape.add_argument("--check-chrome", action="store_true", help="Validate Selenium + Chrome setup and exit")
     scrape.set_defaults(func=command_scrape)
 
     preprocess = subparsers.add_parser("preprocess", help="Preprocess latest/raw JSONL")
