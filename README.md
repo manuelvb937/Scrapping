@@ -24,16 +24,6 @@ pip install -e .
 social-listening --help
 ```
 
-
-### Yahoo realtime scraper runtime requirements
-
-The Yahoo realtime scraper uses Selenium + headless Chrome. Install browser dependencies before scraping:
-
-```bash
-sudo apt update
-sudo apt install -y chromium chromium-driver
-```
-
 ## Run Yahoo realtime scraper
 
 ```bash

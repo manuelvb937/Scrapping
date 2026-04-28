@@ -1,7 +1,7 @@
-"""Yahoo realtime search scraper for collecting X post search results.
+"""Yahoo real-time search scraper for collecting X post search results.
 
-This implementation uses Yahoo Japan realtime pages with Selenium-based dynamic loading,
-which is more robust for Yahoo realtime timelines than static HTML scraping.
+This module intentionally focuses only on raw collection.
+No clustering, topic extraction, or other analysis is implemented here.
 """
 
 from __future__ import annotations
@@ -15,15 +15,17 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import unescape
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 LOGGER = logging.getLogger(__name__)
-YAHOO_REALTIME_URL = "https://search.yahoo.co.jp/realtime/search"
-
-AUTHOR_ID_PATTERN = re.compile(r'<a[^>]*class="[^"]*Tweet_authorID__JKhEb[^"]*"[^>]*>(.*?)</a>', re.DOTALL)
-TIME_PATTERN = re.compile(r'<time[^>]*datetime="([^"]+)"', re.IGNORECASE)
-DATA_CL_PATTERN = re.compile(r'data-cl-params="([^"]+)"')
+YAHOO_SEARCH_URL = "https://search.yahoo.com/search"
+X_URL_PATTERN = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/[^\s\"'<>]+", re.IGNORECASE)
+RESULT_BLOCK_PATTERN = re.compile(r"<li\b[^>]*>(.*?)</li>", re.IGNORECASE | re.DOTALL)
+HREF_PATTERN = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
 TAG_PATTERN = re.compile(r"<[^>]+>")
 
 
@@ -40,98 +42,86 @@ class ScrapeRecord:
     scroll_index: int
 
 
-def set_chromedriver():
-    """Create a headless Chrome webdriver instance."""
-    from selenium import webdriver
-
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+def request_with_retry(url: str, *, attempts: int = 4, timeout_seconds: int = 30) -> str:
+    """Fetch URL with basic retry logic and exponential backoff."""
+    user_agent = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     )
-    return webdriver.Chrome(options=options)
+
+    for attempt in range(1, attempts + 1):
+        req = Request(url, headers={"User-Agent": user_agent})
+        try:
+            with urlopen(req, timeout=timeout_seconds) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except Exception as exc:  # noqa: BLE001
+            if attempt == attempts:
+                raise
+            wait_seconds = (2 ** (attempt - 1)) + random.random()  # nosec B311
+            LOGGER.warning(
+                "Request failed (attempt %s/%s): %s. Retrying in %.2fs",
+                attempt,
+                attempts,
+                exc,
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
+
+    raise RuntimeError("Unexpected retry loop completion.")
 
 
-def parse_tweet_id_from_data_cl(data_cl: str | None) -> str | None:
-    if not data_cl:
-        return None
-    for part in data_cl.split(";"):
-        if part.startswith("twid:"):
-            return part.replace("twid:", "").strip()
-    return None
+def extract_username(url: str) -> str | None:
+    match = re.search(r"(?:x|twitter)\.com/([^/?#]+)/?", url, flags=re.IGNORECASE)
+    return match.group(1) if match else None
 
 
-def _strip_tags(html: str) -> str:
-    text = TAG_PATTERN.sub(" ", html)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def clean_text(raw_html: str) -> str | None:
+    text = TAG_PATTERN.sub(" ", raw_html)
+    text = unescape(text).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text or None
 
 
-def extract_username_from_html(card_html: str) -> str | None:
-    m = AUTHOR_ID_PATTERN.search(card_html)
-    if m:
-        username = _strip_tags(m.group(1)).lstrip("@")
-        return username or None
-
-    text = _strip_tags(card_html)
-    m2 = re.search(r"@([A-Za-z0-9_]{1,15})", text)
-    return m2.group(1) if m2 else None
-
-
-def extract_timestamp_from_html(card_html: str) -> str | None:
-    m = TIME_PATTERN.search(card_html)
-    return m.group(1) if m else None
-
-
-def extract_card_record(
+def extract_records_from_html(
+    html: str,
     *,
-    card_html: str,
     keyword: str,
     query: str,
-    fetched_at: str,
     scroll_index: int,
-) -> tuple[ScrapeRecord | None, str | None]:
-    """Extract one ScrapeRecord and tweet_id from a Yahoo realtime card HTML."""
-    content = _strip_tags(card_html) or None
-    username = extract_username_from_html(card_html)
-    timestamp = extract_timestamp_from_html(card_html)
+    fetched_at: str,
+) -> list[ScrapeRecord]:
+    """Parse Yahoo search HTML and produce records for X/Twitter result links."""
+    records: list[ScrapeRecord] = []
 
-    tweet_id: str | None = None
-    media_urls: list[str] = []
+    for block in RESULT_BLOCK_PATTERN.findall(html):
+        hrefs = HREF_PATTERN.findall(block)
+        candidate_urls = [url for url in hrefs if X_URL_PATTERN.search(url)]
+        media_urls = [url for url in hrefs if url.lower().startswith("http") and not X_URL_PATTERN.search(url)]
 
-    for data_cl in DATA_CL_PATTERN.findall(card_html):
-        parsed_twid = parse_tweet_id_from_data_cl(data_cl)
-        if parsed_twid:
-            tweet_id = parsed_twid
+        if not candidate_urls:
+            candidate_urls.extend(X_URL_PATTERN.findall(block))
 
-    for href in re.findall(r'href="([^"]+)"', card_html):
-        if href.startswith("http") and "search.yahoo.co.jp/realtime/search/tweet/" not in href:
-            media_urls.append(href)
+        if not candidate_urls:
+            continue
 
-    if not tweet_id:
-        return None, None
+        content = clean_text(block)
 
-    yahoo_link = (
-        f"https://search.yahoo.co.jp/realtime/search/tweet/{tweet_id}"
-        "?detail=1&ifr=tl_twdtl&rkf=1"
-    )
+        for url in candidate_urls:
+            records.append(
+                ScrapeRecord(
+                    query=query,
+                    keyword=keyword,
+                    username=extract_username(url),
+                    timestamp=None,
+                    content=content,
+                    url=url,
+                    media_urls=media_urls,
+                    fetched_at=fetched_at,
+                    scroll_index=scroll_index,
+                )
+            )
 
-    record = ScrapeRecord(
-        query=query,
-        keyword=keyword,
-        username=username,
-        timestamp=timestamp,
-        content=content,
-        url=yahoo_link,
-        media_urls=media_urls,
-        fetched_at=fetched_at,
-        scroll_index=scroll_index,
-    )
-    return record, tweet_id
+    return records
 
 
 def deduplicate_records(records: Iterable[ScrapeRecord]) -> list[ScrapeRecord]:
@@ -151,87 +141,6 @@ def deduplicate_records(records: Iterable[ScrapeRecord]) -> list[ScrapeRecord]:
     return deduped
 
 
-def scrape_keyword_with_retry(
-    *,
-    keyword: str,
-    max_scrolls: int,
-    max_posts_per_keyword: int,
-    fetched_at: str,
-    attempts: int = 3,
-) -> list[ScrapeRecord]:
-    """Scrape one keyword with retry around driver startup/navigation failures."""
-    from selenium.common.exceptions import ElementClickInterceptedException, NoSuchElementException, WebDriverException
-    from selenium.webdriver.common.by import By
-
-    query = keyword
-
-    for attempt in range(1, attempts + 1):
-        driver = None
-        try:
-            driver = set_chromedriver()
-            driver.get(f"{YAHOO_REALTIME_URL}?p={keyword}&ei=UTF-8")
-            time.sleep(random.uniform(1.0, 2.0))
-
-            seen_ids: set[str] = set()
-            records: list[ScrapeRecord] = []
-
-            for scroll_index in range(max_scrolls):
-                cards = driver.find_elements(By.CLASS_NAME, "Tweet_Tweet__sna2i")
-                LOGGER.info("keyword='%s' scroll=%s cards=%s", keyword, scroll_index, len(cards))
-
-                for card in cards:
-                    if len(records) >= max_posts_per_keyword:
-                        break
-                    try:
-                        card_html = card.get_attribute("outerHTML")
-                        record, tweet_id = extract_card_record(
-                            card_html=card_html,
-                            keyword=keyword,
-                            query=query,
-                            fetched_at=fetched_at,
-                            scroll_index=scroll_index,
-                        )
-                        if not record or not tweet_id or tweet_id in seen_ids:
-                            continue
-                        seen_ids.add(tweet_id)
-                        records.append(record)
-                    except Exception as card_exc:  # noqa: BLE001
-                        LOGGER.debug("Skipping card due to parse error: %s", card_exc)
-                        continue
-
-                if len(records) >= max_posts_per_keyword:
-                    break
-
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(random.uniform(1.0, 1.5))
-
-                try:
-                    more_link = driver.find_element(By.CSS_SELECTOR, 'a[data-cl-params*="_cl_link:more"]')
-                    driver.execute_script("arguments[0].scrollIntoView(true);", more_link)
-                    time.sleep(0.5)
-                    try:
-                        more_link.click()
-                    except ElementClickInterceptedException:
-                        driver.execute_script("arguments[0].click();", more_link)
-                    time.sleep(random.uniform(1.5, 2.5))
-                except NoSuchElementException:
-                    LOGGER.info("No 'more' link for keyword='%s' at scroll=%s", keyword, scroll_index)
-                    break
-
-            return records
-
-        except WebDriverException as exc:
-            LOGGER.warning("WebDriver failed for keyword='%s' (attempt %s/%s): %s", keyword, attempt, attempts, exc)
-            if attempt == attempts:
-                return []
-            time.sleep((2 ** (attempt - 1)) + random.random())
-        finally:
-            if driver is not None:
-                driver.quit()
-
-    return []
-
-
 def scrape_yahoo_realtime(
     *,
     keywords: list[str],
@@ -240,9 +149,7 @@ def scrape_yahoo_realtime(
     output_dir: str | Path = "data/raw",
     timeout_seconds: int = 30,
 ) -> Path:
-    """Scrape Yahoo realtime results for each keyword and save raw records to JSONL."""
-    del timeout_seconds  # intentionally unused in Selenium-based implementation
-
+    """Scrape Yahoo search results for each keyword and save raw records to JSONL."""
     if max_posts <= 0:
         raise ValueError("max_posts must be > 0")
     if max_scrolls <= 0:
@@ -253,19 +160,34 @@ def scrape_yahoo_realtime(
     fetched_at = datetime.now(timezone.utc).isoformat()
     all_records: list[ScrapeRecord] = []
 
-    max_posts_per_keyword = max(1, max_posts // max(1, len(keywords)))
-
     for keyword in keywords:
-        LOGGER.info("Collecting keyword='%s'", keyword)
-        keyword_records = scrape_keyword_with_retry(
-            keyword=keyword,
-            max_scrolls=max_scrolls,
-            max_posts_per_keyword=max_posts_per_keyword,
-            fetched_at=fetched_at,
-        )
-        all_records.extend(keyword_records)
-        if len(all_records) >= max_posts:
-            break
+        query = f'site:x.com "{keyword}"'
+        LOGGER.info("Collecting keyword='%s' query='%s'", keyword, query)
+
+        for scroll_index in range(max_scrolls):
+            if len(all_records) >= max_posts:
+                break
+
+            start = 1 + (scroll_index * 10)
+            params = urlencode({"p": query, "b": str(start)})
+            url = f"{YAHOO_SEARCH_URL}?{params}"
+
+            html = request_with_retry(url, timeout_seconds=timeout_seconds)
+            records = extract_records_from_html(
+                html,
+                keyword=keyword,
+                query=query,
+                scroll_index=scroll_index,
+                fetched_at=fetched_at,
+            )
+
+            if not records:
+                LOGGER.info("No records found at scroll_index=%s for keyword='%s'", scroll_index, keyword)
+
+            all_records.extend(records)
+
+            if len(all_records) >= max_posts:
+                break
 
     deduped_records = deduplicate_records(all_records)[:max_posts]
 
@@ -273,9 +195,9 @@ def scrape_yahoo_realtime(
     output_path.mkdir(parents=True, exist_ok=True)
     file_path = output_path / f"yahoo_realtime_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
 
-    with file_path.open("w", encoding="utf-8") as file:
+    with file_path.open("w", encoding="utf-8") as f:
         for record in deduped_records:
-            file.write(json.dumps(record.__dict__, ensure_ascii=False) + "\n")
+            f.write(json.dumps(record.__dict__, ensure_ascii=False) + "\n")
 
     LOGGER.info("Saved %s records to %s", len(deduped_records), file_path)
     return file_path
