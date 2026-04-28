@@ -56,6 +56,24 @@ preprocess-posts --input data/raw/yahoo_realtime_<timestamp>.jsonl --output-dir 
 
 Output is written to `data/processed/<input_name>_processed.jsonl`.
 
+
+## LLM provider configuration
+
+Analysis supports two providers:
+
+- OpenAI (default): set `OPENAI_API_KEY`
+- Google Gemini: set `LLM_PROVIDER=gemini` and `GEMINI_API_KEY`
+
+Example (Gemini):
+
+```bash
+export LLM_PROVIDER=gemini
+export GEMINI_API_KEY="your_key"
+export GEMINI_MODEL="gemini-2.5-flash"
+python cli.py analyze
+python cli.py report
+```
+
 ## Run analysis
 
 ```bash
