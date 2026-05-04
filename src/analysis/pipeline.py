@@ -1,15 +1,24 @@
-"""Analysis pipeline: embeddings, clustering, and LLM labeling."""
+"""Analysis pipeline: real embeddings, UMAP+HDBSCAN clustering, and LLM labeling.
+
+Updated to use:
+  - TextEmbedder (BGE-M3) for semantic embeddings (#1)
+  - UMAP + HDBSCAN for clustering (#2)
+  - Per-post sentiment analysis (#4)
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .clustering import cluster_embeddings
-from .embeddings import embed_text
+from .embeddings import TextEmbedder
 from .llm_labeling import LLMTopicSentimentLabeler
+
+LOGGER = logging.getLogger(__name__)
 
 
 def load_processed_jsonl(path: Path) -> list[dict]:
@@ -30,14 +39,30 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
 
     posts = load_processed_jsonl(input_path)
     texts = [str(post.get("cleaned_content") or post.get("content") or "") for post in posts]
-    embeddings = [embed_text(text) for text in texts]
+
+    # Improvement #1: Use real multilingual embeddings (BGE-M3)
+    embedder = TextEmbedder()
+    embeddings = embedder.embed_texts(texts)
+
+    # Improvement #2: Use UMAP + HDBSCAN clustering
     clusters = cluster_embeddings(embeddings)
 
-    clusters_payload: list[dict] = []
     labeler = LLMTopicSentimentLabeler()
+
+    # Improvement #4: Run per-post sentiment analysis
+    LOGGER.info("Running per-post sentiment analysis on %d posts...", len(texts))
+    post_sentiments = labeler.analyze_posts_batch(texts)
+
+    # Build sentiment lookup (index -> sentiment)
+    sentiment_by_index: dict[int, str] = {}
+    for ps in post_sentiments:
+        sentiment_by_index[ps.index] = ps.sentiment
+
+    clusters_payload: list[dict] = []
     analysis_payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_file": str(input_path),
+        "total_posts": len(posts),
         "clusters": [],
     }
 
@@ -45,15 +70,28 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
         cluster_posts = [posts[idx] for idx in cluster.indices]
         cluster_texts = [texts[idx] for idx in cluster.indices]
 
+        # Annotate each post with its individual sentiment
+        for idx in cluster.indices:
+            if idx < len(posts):
+                posts[idx]["post_sentiment"] = sentiment_by_index.get(idx, "neutral")
+
+        # Compute per-post sentiment distribution for this cluster
+        sentiment_dist = {"positive": 0, "negative": 0, "neutral": 0}
+        for idx in cluster.indices:
+            s = sentiment_by_index.get(idx, "neutral")
+            sentiment_dist[s] = sentiment_dist.get(s, 0) + 1
+
         clusters_payload.append(
             {
                 "cluster_id": cluster.cluster_id,
                 "size": len(cluster.indices),
                 "post_indices": cluster.indices,
                 "posts": cluster_posts,
+                "sentiment_distribution": sentiment_dist,
             }
         )
 
+        # Cluster-level topic + sentiment analysis via LLM
         cluster_analysis = labeler.analyze_cluster(cluster.cluster_id, cluster_texts)
         analysis_payload["clusters"].append(
             {
@@ -62,6 +100,7 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
                 "sentiment": cluster_analysis.sentiment,
                 "rationale": cluster_analysis.rationale,
                 "size": len(cluster.indices),
+                "sentiment_distribution": sentiment_dist,
             }
         )
 

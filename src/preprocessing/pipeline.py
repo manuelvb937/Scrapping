@@ -7,7 +7,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .cleaning import clean_text
+from .cleaning import clean_text, extract_hashtags
 from .deduplicate import deduplicate_posts
 from .language import detect_language
 
@@ -27,6 +27,7 @@ def enrich_post(post: dict) -> dict:
     """Create processed record while preserving raw fields untouched."""
     content = post.get("content")
     processed = dict(post)
+    processed["hashtags"] = extract_hashtags(content)
     processed["cleaned_content"] = clean_text(content)
     processed["language"] = detect_language(content)
     processed["processed_at"] = datetime.now(timezone.utc).isoformat()

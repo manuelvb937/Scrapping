@@ -19,12 +19,14 @@ def test_generate_reports_creates_markdown_html_and_csv(tmp_path: Path) -> None:
                     {"content": "Love the new feature"},
                     {"content": "Great campaign launch"},
                 ],
+                "sentiment_distribution": {"positive": 2, "negative": 0, "neutral": 0},
             },
             {
                 "cluster_id": 1,
                 "size": 1,
                 "post_indices": [2],
                 "posts": [{"content": "Terrible user experience"}],
+                "sentiment_distribution": {"positive": 0, "negative": 1, "neutral": 0},
             },
         ]
     }
@@ -36,6 +38,7 @@ def test_generate_reports_creates_markdown_html_and_csv(tmp_path: Path) -> None:
                 "sentiment": "positive",
                 "rationale": "Users celebrate launch and value.",
                 "size": 2,
+                "sentiment_distribution": {"positive": 2, "negative": 0, "neutral": 0},
             },
             {
                 "cluster_id": 1,
@@ -43,6 +46,7 @@ def test_generate_reports_creates_markdown_html_and_csv(tmp_path: Path) -> None:
                 "sentiment": "negative",
                 "rationale": "Users mention experience issues.",
                 "size": 1,
+                "sentiment_distribution": {"positive": 0, "negative": 1, "neutral": 0},
             },
         ]
     }
@@ -60,12 +64,20 @@ def test_generate_reports_creates_markdown_html_and_csv(tmp_path: Path) -> None:
     assert "Positive Topics" in md_content
     assert "Negative Topics" in md_content
     assert "Representative posts" in md_content
+    # Improvement #5: Marketing strategies section should be present
+    assert "Marketing Strategy Recommendations" in md_content
+    # Per-post sentiment distribution should appear in cluster details
+    assert "Post-level sentiment" in md_content
 
     assert "<html>" in html_content
     assert "feature_launch" in html_content
+    # HTML should properly render bold text
+    assert "<strong>" in html_content
 
     with csv_path.open("r", encoding="utf-8") as file:
         rows = list(csv.DictReader(file))
 
     assert len(rows) == 2
     assert {row["topic_label"] for row in rows} == {"feature_launch", "ux_issue"}
+    # CSV should include sentiment percentages
+    assert "positive_pct" in rows[0]

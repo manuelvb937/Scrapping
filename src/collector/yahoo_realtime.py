@@ -10,9 +10,11 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,6 +29,26 @@ TIME_PATTERN = re.compile(r'<time[^>]*datetime="([^"]+)"', re.IGNORECASE)
 DATA_CL_PATTERN = re.compile(r'data-cl-params="([^"]+)"')
 TAG_PATTERN = re.compile(r"<[^>]+>")
 BROWSER_CANDIDATES = ["google-chrome", "chromium", "chromium-browser", "chrome"]
+
+# Windows-specific Chrome install paths
+WINDOWS_CHROME_PATHS = [
+    os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+    os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+    os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+]
+
+# Improvement #6: Multiple fallback selectors for resilience against Yahoo HTML changes
+CARD_SELECTORS = [
+    ("css", ".Tweet_Tweet__sna2i"),                 # Current primary class
+    ("css", "article[data-cl-params*='twid:']"),    # Structural: article with tweet ID
+    ("css", "[data-cl-params*='twid:']"),            # Any element with tweet ID data attr
+]
+
+MORE_LINK_SELECTORS = [
+    ("css", 'a[data-cl-params*="_cl_link:more"]'),   # Current primary
+    ("css", 'a[data-cl-params*="more"]'),             # Broader match
+    ("xpath", '//a[contains(text(), "もっと見る")]'),   # Japanese "See more" text
+]
 
 
 @dataclass(frozen=True)
@@ -44,10 +66,19 @@ class ScrapeRecord:
 
 
 def find_browser_binary() -> str | None:
+    """Find Chrome/Chromium binary, checking PATH and Windows install locations."""
+    # Check PATH first (works on Linux/macOS)
     for candidate in BROWSER_CANDIDATES:
         path = shutil.which(candidate)
         if path:
             return path
+
+    # On Windows, Chrome isn't on PATH — check standard install locations
+    if sys.platform == "win32":
+        for path in WINDOWS_CHROME_PATHS:
+            if os.path.isfile(path):
+                LOGGER.info("Found Chrome at Windows path: %s", path)
+                return path
     return None
 
 
@@ -201,6 +232,57 @@ def deduplicate_records(records: Iterable[ScrapeRecord]) -> list[ScrapeRecord]:
     return deduped
 
 
+def find_tweet_cards(driver) -> list:
+    """Find tweet card elements using multiple fallback selectors.
+
+    Improvement #6: Tries several CSS/XPath selectors in order to be resilient
+    against Yahoo frontend changes that alter class names.
+    """
+    from selenium.webdriver.common.by import By
+
+    for selector_type, selector in CARD_SELECTORS:
+        try:
+            if selector_type == "css":
+                cards = driver.find_elements(By.CSS_SELECTOR, selector)
+            elif selector_type == "xpath":
+                cards = driver.find_elements(By.XPATH, selector)
+            else:
+                continue
+
+            if cards:
+                LOGGER.debug(
+                    "Found %d cards using selector %s='%s'", len(cards), selector_type, selector
+                )
+                return cards
+        except Exception:  # noqa: BLE001
+            continue
+
+    LOGGER.warning("No cards found with any selector strategy")
+    return []
+
+
+def find_more_link(driver):
+    """Find the 'more' pagination link using multiple fallback selectors.
+
+    Improvement #6: Tries several selectors for the pagination link.
+    """
+    from selenium.webdriver.common.by import By
+
+    for selector_type, selector in MORE_LINK_SELECTORS:
+        try:
+            if selector_type == "css":
+                element = driver.find_element(By.CSS_SELECTOR, selector)
+            elif selector_type == "xpath":
+                element = driver.find_element(By.XPATH, selector)
+            else:
+                continue
+            return element
+        except Exception:  # noqa: BLE001
+            continue
+
+    return None
+
+
 def scrape_keyword_with_retry(
     *,
     keyword: str,
@@ -210,8 +292,7 @@ def scrape_keyword_with_retry(
     attempts: int = 3,
 ) -> list[ScrapeRecord]:
     """Scrape one keyword with retry around driver startup/navigation failures."""
-    from selenium.common.exceptions import ElementClickInterceptedException, NoSuchElementException, WebDriverException
-    from selenium.webdriver.common.by import By
+    from selenium.common.exceptions import ElementClickInterceptedException, WebDriverException
 
     query = keyword
 
@@ -226,7 +307,8 @@ def scrape_keyword_with_retry(
             records: list[ScrapeRecord] = []
 
             for scroll_index in range(max_scrolls):
-                cards = driver.find_elements(By.CLASS_NAME, "Tweet_Tweet__sna2i")
+                # Improvement #6: Use resilient multi-selector card finder
+                cards = find_tweet_cards(driver)
                 LOGGER.info("keyword='%s' scroll=%s cards=%s", keyword, scroll_index, len(cards))
 
                 for card in cards:
@@ -255,8 +337,13 @@ def scrape_keyword_with_retry(
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(random.uniform(1.0, 1.5))
 
+                # Improvement #6: Use resilient more-link finder
+                more_link = find_more_link(driver)
+                if more_link is None:
+                    LOGGER.info("No 'more' link for keyword='%s' at scroll=%s", keyword, scroll_index)
+                    break
+
                 try:
-                    more_link = driver.find_element(By.CSS_SELECTOR, 'a[data-cl-params*="_cl_link:more"]')
                     driver.execute_script("arguments[0].scrollIntoView(true);", more_link)
                     time.sleep(0.5)
                     try:
@@ -264,8 +351,8 @@ def scrape_keyword_with_retry(
                     except ElementClickInterceptedException:
                         driver.execute_script("arguments[0].click();", more_link)
                     time.sleep(random.uniform(1.5, 2.5))
-                except NoSuchElementException:
-                    LOGGER.info("No 'more' link for keyword='%s' at scroll=%s", keyword, scroll_index)
+                except Exception as click_exc:  # noqa: BLE001
+                    LOGGER.info("Could not click 'more' link for keyword='%s': %s", keyword, click_exc)
                     break
 
             return records
@@ -290,7 +377,12 @@ def scrape_yahoo_realtime(
     output_dir: str | Path = "data/raw",
     timeout_seconds: int = 30,
 ) -> Path:
-    """Scrape Yahoo realtime results for each keyword and save raw records to JSONL."""
+    """Scrape Yahoo realtime results for each keyword and save raw records to JSONL.
+
+    Improvement #3: Records are written to disk after each keyword completes (batch
+    checkpointing). If a crash occurs mid-scrape, previously completed keywords are
+    already persisted to disk.
+    """
     del timeout_seconds  # intentionally unused in Selenium-based implementation
 
     if max_posts <= 0:
@@ -303,33 +395,56 @@ def scrape_yahoo_realtime(
     validate_chrome_setup()
 
     fetched_at = datetime.now(timezone.utc).isoformat()
-    all_records: list[ScrapeRecord] = []
 
     max_posts_per_keyword = max(1, max_posts // max(1, len(keywords)))
 
+    # Improvement #3: Create output file up-front and append per-keyword batches
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    file_path = output_path / f"yahoo_realtime_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
+
+    total_saved = 0
+    global_seen: set[str] = set()
+
     for keyword in keywords:
-        LOGGER.info("Collecting keyword='%s'", keyword)
+        if total_saved >= max_posts:
+            LOGGER.info("Reached max_posts=%s, stopping early", max_posts)
+            break
+
+        LOGGER.info("Collecting keyword='%s' (%d/%d saved so far)", keyword, total_saved, max_posts)
         keyword_records = scrape_keyword_with_retry(
             keyword=keyword,
             max_scrolls=max_scrolls,
             max_posts_per_keyword=max_posts_per_keyword,
             fetched_at=fetched_at,
         )
-        all_records.extend(keyword_records)
-        if len(all_records) >= max_posts:
-            break
 
-    deduped_records = deduplicate_records(all_records)[:max_posts]
+        # Deduplicate within this keyword batch and against global set
+        new_records: list[ScrapeRecord] = []
+        for record in keyword_records:
+            fingerprint = hashlib.sha256(
+                f"{record.query}|{record.keyword}|{record.url}|{record.content}".encode("utf-8")
+            ).hexdigest()
+            if fingerprint in global_seen:
+                continue
+            global_seen.add(fingerprint)
+            new_records.append(record)
+            if total_saved + len(new_records) >= max_posts:
+                break
 
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    file_path = output_path / f"yahoo_realtime_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
+        # Improvement #3: Write this keyword's batch to disk immediately
+        if new_records:
+            with file_path.open("a", encoding="utf-8") as file:
+                for record in new_records:
+                    file.write(json.dumps(record.__dict__, ensure_ascii=False) + "\n")
 
-    with file_path.open("w", encoding="utf-8") as file:
-        for record in deduped_records:
-            file.write(json.dumps(record.__dict__, ensure_ascii=False) + "\n")
+            total_saved += len(new_records)
+            LOGGER.info(
+                "Checkpoint: saved %d records for keyword='%s' (total: %d)",
+                len(new_records), keyword, total_saved,
+            )
 
-    LOGGER.info("Saved %s records to %s", len(deduped_records), file_path)
+    LOGGER.info("Scraping complete. Total records saved: %d -> %s", total_saved, file_path)
     return file_path
 
 

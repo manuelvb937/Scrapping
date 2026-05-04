@@ -4,6 +4,8 @@ from collector.yahoo_realtime import (
     extract_card_record,
     parse_tweet_id_from_data_cl,
     validate_chrome_setup,
+    CARD_SELECTORS,
+    MORE_LINK_SELECTORS,
 )
 
 
@@ -66,3 +68,12 @@ def test_validate_chrome_setup_raises_when_browser_missing(monkeypatch) -> None:
         assert False, "validate_chrome_setup should raise when browser is missing"
     except RuntimeError as exc:
         assert "Chrome/Chromium browser not found" in str(exc)
+
+
+def test_card_selectors_has_multiple_fallbacks() -> None:
+    """Improvement #6: Multiple selector strategies are defined."""
+    assert len(CARD_SELECTORS) >= 3, "Should have at least 3 fallback selectors"
+    assert len(MORE_LINK_SELECTORS) >= 2, "Should have at least 2 more-link selectors"
+
+    # Primary selector should be the current class name
+    assert CARD_SELECTORS[0][1] == ".Tweet_Tweet__sna2i"
