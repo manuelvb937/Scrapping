@@ -4,6 +4,8 @@ Updated to use:
   - TextEmbedder (BGE-M3) for semantic embeddings (#1)
   - UMAP + HDBSCAN for clustering (#2)
   - Per-post sentiment analysis (#4)
+  - Text preparation for clustering (title/noise stripping)
+  - Diagnostics, representative posts, and top keywords per cluster
 """
 
 from __future__ import annotations
@@ -14,9 +16,16 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .clustering import cluster_embeddings
+from .clustering import cluster_embeddings, Cluster
 from .embeddings import TextEmbedder
 from .llm_labeling import LLMTopicSentimentLabeler
+from .text_preparation import (
+    prepare_clustering_texts,
+    extract_top_keywords,
+    extract_search_term_fragments,
+    select_representative_posts,
+    clean_for_llm,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -38,37 +47,96 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     posts = load_processed_jsonl(input_path)
-    texts = [str(post.get("cleaned_content") or post.get("content") or "") for post in posts]
 
-    # Improvement #1: Use real multilingual embeddings (BGE-M3)
+    # --- Text preparation ---
+    # Create clustering_text by stripping search terms, usernames, timestamps
+    # The original cleaned_content is preserved for display and sentiment analysis
+    LOGGER.info("Preparing clustering texts (stripping titles and noise)...")
+    clustering_texts, valid_indices = prepare_clustering_texts(posts)
+
+    # Extract search-term fragments for dynamic stopword filtering
+    search_term_stopwords = extract_search_term_fragments(posts)
+    LOGGER.info(
+        "Search-term stopwords extracted: %s",
+        search_term_stopwords,
+    )
+
+    # Full texts for sentiment analysis (use cleaned_content, not clustering_text)
+    all_texts = [str(post.get("cleaned_content") or post.get("content") or "") for post in posts]
+
+    # --- Embeddings ---
+    # Embed clustering_text (title-stripped) instead of cleaned_content
     embedder = TextEmbedder()
-    embeddings = embedder.embed_texts(texts)
+    embeddings = embedder.embed_texts(clustering_texts)
 
-    # Improvement #2: Use UMAP + HDBSCAN clustering
-    clusters = cluster_embeddings(embeddings)
+    # --- Clustering ---
+    clusters, diagnostics = cluster_embeddings(embeddings)
 
+    # Map cluster indices back to original post indices
+    # (clustering was done on valid_indices subset, not all posts)
+    remapped_clusters: list[Cluster] = []
+    clustered_original_indices: set[int] = set()
+    for cluster in clusters:
+        original_indices = [valid_indices[i] for i in cluster.indices]
+        remapped_clusters.append(Cluster(cluster_id=cluster.cluster_id, indices=original_indices))
+        clustered_original_indices.update(original_indices)
+
+    # Add unclustered posts (those skipped during text preparation) as a separate cluster
+    skipped_indices = [i for i in range(len(posts)) if i not in clustered_original_indices]
+    if skipped_indices:
+        unclustered_id = max(c.cluster_id for c in remapped_clusters) + 1 if remapped_clusters else 0
+        remapped_clusters.append(Cluster(cluster_id=unclustered_id, indices=skipped_indices))
+        LOGGER.info(
+            "%d posts were too short after title stripping — grouped as cluster %d",
+            len(skipped_indices), unclustered_id,
+        )
+
+    # --- Per-post sentiment analysis ---
+    # Clean texts for LLM input (strip URLs, usernames, timestamps to save tokens)
+    llm_texts = [clean_for_llm(t) for t in all_texts]
     labeler = LLMTopicSentimentLabeler()
-
-    # Improvement #4: Run per-post sentiment analysis
-    LOGGER.info("Running per-post sentiment analysis on %d posts...", len(texts))
-    post_sentiments = labeler.analyze_posts_batch(texts)
+    LOGGER.info("Running per-post sentiment analysis on %d posts...", len(llm_texts))
+    post_sentiments = labeler.analyze_posts_batch(llm_texts)
 
     # Build sentiment lookup (index -> sentiment)
     sentiment_by_index: dict[int, str] = {}
     for ps in post_sentiments:
         sentiment_by_index[ps.index] = ps.sentiment
 
+    # --- Build output ---
     clusters_payload: list[dict] = []
     analysis_payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_file": str(input_path),
         "total_posts": len(posts),
+        "diagnostics": {
+            "cluster_count": diagnostics.cluster_count,
+            "cluster_sizes": diagnostics.cluster_sizes,
+            "largest_cluster_ratio": round(diagnostics.largest_cluster_ratio, 3),
+            "noise_count": diagnostics.noise_count,
+            "clustered_posts": len(valid_indices),
+            "skipped_posts": len(skipped_indices) if skipped_indices else 0,
+            "warning": diagnostics.warning,
+        },
         "clusters": [],
     }
 
-    for cluster in clusters:
+    for cluster in remapped_clusters:
         cluster_posts = [posts[idx] for idx in cluster.indices]
-        cluster_texts = [texts[idx] for idx in cluster.indices]
+        cluster_texts = [all_texts[idx] for idx in cluster.indices]
+
+        # Get clustering_text versions for keyword extraction
+        cluster_clustering_texts = []
+        for idx in cluster.indices:
+            if idx in clustered_original_indices and idx in set(valid_indices):
+                # Find position in valid_indices
+                try:
+                    vi_pos = valid_indices.index(idx)
+                    cluster_clustering_texts.append(clustering_texts[vi_pos])
+                except ValueError:
+                    cluster_clustering_texts.append(all_texts[idx])
+            else:
+                cluster_clustering_texts.append(all_texts[idx])
 
         # Annotate each post with its individual sentiment
         for idx in cluster.indices:
@@ -81,6 +149,12 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
             s = sentiment_by_index.get(idx, "neutral")
             sentiment_dist[s] = sentiment_dist.get(s, 0) + 1
 
+        # Extract top keywords and representative posts for this cluster
+        top_keywords = extract_top_keywords(
+            cluster_clustering_texts, top_n=10, search_terms=search_term_stopwords,
+        )
+        representative = select_representative_posts(cluster_clustering_texts, limit=5)
+
         clusters_payload.append(
             {
                 "cluster_id": cluster.cluster_id,
@@ -88,11 +162,19 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
                 "post_indices": cluster.indices,
                 "posts": cluster_posts,
                 "sentiment_distribution": sentiment_dist,
+                "top_keywords": [{"keyword": kw, "count": cnt} for kw, cnt in top_keywords],
+                "representative_posts": representative,
             }
         )
 
         # Cluster-level topic + sentiment analysis via LLM
-        cluster_analysis = labeler.analyze_cluster(cluster.cluster_id, cluster_texts)
+        cluster_analysis = labeler.analyze_cluster(
+            cluster.cluster_id,
+            cluster_texts,
+            top_keywords=top_keywords,
+            representative_texts=representative,
+            search_terms=search_term_stopwords,
+        )
         analysis_payload["clusters"].append(
             {
                 "cluster_id": cluster_analysis.cluster_id,
@@ -101,8 +183,14 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
                 "rationale": cluster_analysis.rationale,
                 "size": len(cluster.indices),
                 "sentiment_distribution": sentiment_dist,
+                "top_keywords": [{"keyword": kw, "count": cnt} for kw, cnt in top_keywords],
+                "representative_posts": representative,
             }
         )
+
+        # Delay between cluster LLM calls to stay under Gemini free-tier rate limit
+        import time
+        time.sleep(10.0)
 
     clusters_path = output_dir / "clusters.json"
     analysis_path = output_dir / "analysis.json"

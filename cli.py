@@ -22,6 +22,7 @@ from analysis.pipeline import run_analysis
 from collector.yahoo_realtime import scrape_yahoo_realtime, smoke_test_chrome_driver
 from preprocessing.pipeline import preprocess_raw_file
 from reporting.generator import generate_reports
+from reporting.exporter import export_processed_to_html
 
 
 def latest_file(directory: Path, pattern: str) -> Path | None:
@@ -80,6 +81,15 @@ def command_report(args: argparse.Namespace) -> None:
     print(f"Clusters CSV: {csv_path}")
 
 
+def command_export(args: argparse.Namespace) -> None:
+    input_path = Path(args.input) if args.input else latest_file(Path(args.processed_dir), "*.jsonl")
+    if input_path is None:
+        raise FileNotFoundError(f"No processed JSONL files found in {args.processed_dir}")
+
+    output_path = export_processed_to_html(input_path, Path(args.reports_dir))
+    print(f"Data successfully exported and opened: {output_path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Social listening unified CLI")
     parser.add_argument("--raw-dir", default="data/raw", help="Raw data directory")
@@ -107,6 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--clusters", default=None, help="Path to clusters.json (defaults to reports dir)")
     report.add_argument("--analysis", default=None, help="Path to analysis.json (defaults to reports dir)")
     report.set_defaults(func=command_report)
+
+    export = subparsers.add_parser("export", help="Export processed data to an HTML table for manual inspection")
+    export.add_argument("--input", default=None, help="Processed JSONL input (defaults to latest in processed dir)")
+    export.set_defaults(func=command_export)
 
     return parser
 

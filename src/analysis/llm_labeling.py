@@ -39,10 +39,16 @@ NEGATIVE_WORDS = {
 CLUSTER_SYSTEM_PROMPT = (
     "You are a Japanese social media analyst specializing in social listening for marketing. "
     "Analyze the following cluster of social media posts (primarily Japanese). "
-    "Return a JSON object with keys: topic_label (concise topic name in Japanese if posts are Japanese, "
+    "These posts have already been grouped by semantic similarity. "
+    "Your job is to identify the SPECIFIC SUBTOPIC that distinguishes this cluster from others. "
+    "Do NOT use the overall search term as the topic label — instead, identify what makes THIS "
+    "group of posts different (e.g., 'ドラマSeason2の感想', '6巻の感想', 'Blu-ray購入意欲', "
+    "'キャスト・俳優の話題', '公式キャンペーン告知', etc.). "
+    "Return a JSON object with keys: topic_label (specific subtopic name in Japanese if posts are Japanese, "
     "otherwise in the posts' language), sentiment (one of: positive, negative, neutral), "
     "and rationale (brief explanation in Japanese if posts are Japanese). "
-    "日本語のソーシャルメディア投稿を分析し、トピックとセンチメントを判定してください。"
+    "日本語のソーシャルメディア投稿を分析し、具体的なサブトピックとセンチメントを判定してください。"
+    "検索キーワードそのものをトピックラベルにしないでください。"
 )
 
 POST_SENTIMENT_SYSTEM_PROMPT = (
@@ -76,20 +82,48 @@ class LLMTopicSentimentLabeler:
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
 
-    def analyze_cluster(self, cluster_id: int, texts: list[str]) -> ClusterAnalysis:
+    def analyze_cluster(
+        self,
+        cluster_id: int,
+        texts: list[str],
+        *,
+        top_keywords: list[tuple[str, int]] | None = None,
+        representative_texts: list[str] | None = None,
+        search_terms: set[str] | None = None,
+    ) -> ClusterAnalysis:
         """Analyze one cluster with structured JSON output from an LLM.
+
+        Args:
+            cluster_id: Cluster identifier.
+            texts: All texts in this cluster.
+            top_keywords: Optional list of (keyword, count) tuples for context.
+            representative_texts: Optional diverse representative posts to send
+                instead of the raw first-N texts.
+            search_terms: Optional set of search-term fragments.  Passed to
+                the LLM prompt so it knows to ignore them when labeling.
 
         Falls back to a deterministic heuristic when required API key is unavailable.
         """
         if not texts:
             return ClusterAnalysis(cluster_id, "empty", "neutral", "No texts in cluster")
 
+        # Use representative texts if provided, else fall back to first 20
+        sample_texts = representative_texts or texts[:20]
+
         if self.provider == "gemini" and self.gemini_api_key:
-            parsed = self._call_with_retry(lambda: self._analyze_with_gemini(texts))
+            parsed = self._call_with_retry(
+                lambda: self._analyze_with_gemini(
+                    sample_texts, top_keywords=top_keywords, search_terms=search_terms,
+                )
+            )
             return self._build_cluster_analysis(cluster_id, parsed)
 
         if self.provider == "openai" and self.openai_api_key:
-            parsed = self._call_with_retry(lambda: self._analyze_with_openai(texts))
+            parsed = self._call_with_retry(
+                lambda: self._analyze_with_openai(
+                    sample_texts, top_keywords=top_keywords, search_terms=search_terms,
+                )
+            )
             return self._build_cluster_analysis(cluster_id, parsed)
 
         missing_key = "GEMINI_API_KEY" if self.provider == "gemini" else "OPENAI_API_KEY"
@@ -139,6 +173,10 @@ class LLMTopicSentimentLabeler:
                 for i, text in zip(batch_indices, batch):
                     sentiment = self._heuristic_sentiment(text)
                     all_sentiments.append(PostSentiment(index=i, sentiment=sentiment))
+
+            # Delay between batch LLM calls to stay under API rate limits
+            if has_api:
+                time.sleep(10.0)
 
         return all_sentiments
 
@@ -257,7 +295,14 @@ class LLMTopicSentimentLabeler:
         parsed = self._extract_gemini_structured_json(body)
         return parsed.get("sentiments", [])
 
-    def _analyze_with_openai(self, texts: list[str]) -> dict[str, Any]:
+    def _analyze_with_openai(
+        self,
+        texts: list[str],
+        *,
+        top_keywords: list[tuple[str, int]] | None = None,
+        search_terms: set[str] | None = None,
+    ) -> dict[str, Any]:
+        user_content = self._build_cluster_user_prompt(texts, top_keywords, search_terms=search_terms)
         payload = {
             "model": self.model,
             "input": [
@@ -275,7 +320,7 @@ class LLMTopicSentimentLabeler:
                     "content": [
                         {
                             "type": "input_text",
-                            "text": "Cluster posts:\n" + "\n".join(f"- {text}" for text in texts[:20]),
+                            "text": user_content,
                         }
                     ],
                 },
@@ -314,11 +359,15 @@ class LLMTopicSentimentLabeler:
 
         return self._extract_openai_structured_json(body)
 
-    def _analyze_with_gemini(self, texts: list[str]) -> dict[str, Any]:
-        prompt = (
-            CLUSTER_SYSTEM_PROMPT + "\n\n"
-            "Cluster posts:\n" + "\n".join(f"- {text}" for text in texts[:20])
-        )
+    def _analyze_with_gemini(
+        self,
+        texts: list[str],
+        *,
+        top_keywords: list[tuple[str, int]] | None = None,
+        search_terms: set[str] | None = None,
+    ) -> dict[str, Any]:
+        user_content = self._build_cluster_user_prompt(texts, top_keywords, search_terms=search_terms)
+        prompt = CLUSTER_SYSTEM_PROMPT + "\n\n" + user_content
 
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -385,8 +434,47 @@ class LLMTopicSentimentLabeler:
             cluster_id=cluster_id,
             topic_label=str(parsed.get("topic_label", "unknown-topic")),
             sentiment=sentiment,
-            rationale=str(parsed.get("rationale", "")),
+               rationale=str(parsed.get("rationale", "")),
         )
+
+    def _build_cluster_user_prompt(
+        self,
+        texts: list[str],
+        top_keywords: list[tuple[str, int]] | None = None,
+        *,
+        search_terms: set[str] | None = None,
+    ) -> str:
+        """Build the user prompt for cluster analysis.
+
+        Args:
+            texts: Representative texts for the cluster.
+            top_keywords: Top keywords with counts.
+            search_terms: Search-term fragments to tell the LLM to ignore.
+        """
+        parts: list[str] = []
+
+        # Tell the LLM which search terms to ignore in topic labeling
+        if search_terms:
+            terms_str = ", ".join(sorted(search_terms))
+            parts.append(
+                f"IMPORTANT: The following terms are the original search queries used to "
+                f"collect these posts. Do NOT use them as the topic label — they appear "
+                f"in every cluster and are not distinctive: {terms_str}"
+            )
+            parts.append(
+                f"重要: 以下の検索キーワードはトピックラベルに使用しないでください（全クラスタに共通）: {terms_str}"
+            )
+            parts.append("")
+
+        if top_keywords:
+            kw_str = ", ".join(f"{kw} ({count})" for kw, count in top_keywords[:15])
+            parts.append(f"Top keywords in this cluster: {kw_str}")
+            parts.append(f"Cluster size: {len(texts)} posts")
+            parts.append("")
+        parts.append("Representative posts:")
+        for text in texts[:15]:
+            parts.append(f"- {text}")
+        return "\n".join(parts)
 
     def _heuristic_sentiment(self, text: str) -> str:
         """Classify a single text's sentiment using keyword matching.
