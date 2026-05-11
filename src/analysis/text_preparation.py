@@ -37,6 +37,10 @@ TRAILING_USER_TS = re.compile(
 
 # Reply prefix
 REPLY_PREFIX = re.compile(r"^返信先:\s*", re.UNICODE)
+REPLY_CONTEXT = re.compile(
+    r"(?:返信先|replying\s+to)[:：]?\s*(?:@?\w{2,30}\s*){1,4}",
+    re.IGNORECASE | re.UNICODE,
+)
 
 # Residual URLs that survived cleaning (partial domains, pic.x.com, etc.)
 RESIDUAL_URL = re.compile(
@@ -78,6 +82,10 @@ TOPIC_STOPWORDS = {
     # Common scraped/web noise
     "amp", "utm", "source", "medium", "search", "yjrealtime", "pic", "https", "http",
     "www", "com", "co", "jp",
+    "返信", "返信先", "reply", "replies", "replying", "to", "rt", "via",
+    "twitter", "tweet", "post", "user", "account", "follow", "フォロー",
+    "こちら", "これ", "それ", "あれ", "ここ", "そこ", "ため", "もの",
+    "する", "なる", "いる", "ある", "ない", "さん", "ちゃん", "くん",
 }
 
 
@@ -191,6 +199,7 @@ def prepare_clustering_text(post: dict) -> str:
 
     # Strip reply prefix
     text = REPLY_PREFIX.sub("", text)
+    text = REPLY_CONTEXT.sub(" ", text)
 
     # Strip trailing "nickname @ handle timestamp"
     text = TRAILING_USER_TS.sub("", text)
@@ -447,9 +456,37 @@ def _keep_topic_token(token: str, *, search_terms: set[str]) -> bool:
         return False
     if token in TOPIC_STOPWORDS:
         return False
+    if _looks_like_topic_noise(token):
+        return False
     if token.isdigit():
         return False
     return not _is_search_term_token(token, search_terms)
+
+
+def _looks_like_topic_noise(token: str) -> bool:
+    useful_latin = {
+        "netflix", "hulu", "unext", "u-next", "telasa", "fod", "amazon",
+        "rakuten", "youtube", "tver", "bl", "blcd", "dvd", "blu", "ray",
+        "bluray", "sns", "x",
+    }
+    if token in useful_latin:
+        return False
+    if re.fullmatch(r"[_\W]+", token, flags=re.UNICODE):
+        return True
+    if re.fullmatch(r"[━─✨❤♥♡❣️‼!?！？・、。,.\\/\-_=]+", token, flags=re.UNICODE):
+        return True
+    if re.fullmatch(r"[a-z]{8,}\d*", token) and _has_repeated_character_run(token):
+        return True
+    if re.fullmatch(r"[a-z0-9_]{10,}", token) and not any(marker in token for marker in useful_latin):
+        return True
+    return False
+
+
+def _has_repeated_character_run(token: str) -> bool:
+    return any(
+        token[index] == token[index - 1] == token[index - 2]
+        for index in range(2, len(token))
+    )
 
 
 def _is_search_term_token(token: str, search_terms: set[str]) -> bool:
@@ -580,6 +617,7 @@ def clean_for_llm(text: str) -> str:
 
     # Strip reply prefix
     text = REPLY_PREFIX.sub("", text)
+    text = REPLY_CONTEXT.sub(" ", text)
 
     # Strip trailing "nickname @ handle timestamp"
     text = TRAILING_USER_TS.sub("", text)

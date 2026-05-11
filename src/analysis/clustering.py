@@ -5,7 +5,7 @@ Embeddings → UMAP → HDBSCAN pipeline for scientifically sound clustering tha
 auto-determines the number of clusters and handles noise.
 
 Tuning update: Parameters optimised for social-listening use cases where posts
-share a common search term and need finer-grained subtopic separation.
+share a common search term and need stable, inspectable subtopic separation.
 """
 
 from __future__ import annotations
@@ -50,9 +50,9 @@ def cluster_embeddings(
     Args:
         embeddings: List of embedding vectors from TextEmbedder.
         min_cluster_size: Minimum number of posts to form a cluster.
-            Defaults to env var HDBSCAN_MIN_CLUSTER_SIZE or 3.
+            Defaults to env var HDBSCAN_MIN_CLUSTER_SIZE or 6.
         min_samples: Controls clustering conservativeness.
-            Defaults to env var HDBSCAN_MIN_SAMPLES or 1.
+            Defaults to env var HDBSCAN_MIN_SAMPLES or 2.
         umap_components: Number of dimensions for UMAP reduction.
 
     Returns:
@@ -68,9 +68,9 @@ def cluster_embeddings(
         return [], diag
 
     if min_cluster_size is None:
-        min_cluster_size = int(os.getenv("HDBSCAN_MIN_CLUSTER_SIZE", "3"))
+        min_cluster_size = int(os.getenv("HDBSCAN_MIN_CLUSTER_SIZE", "6"))
     if min_samples is None:
-        min_samples = int(os.getenv("HDBSCAN_MIN_SAMPLES", "1"))
+        min_samples = int(os.getenv("HDBSCAN_MIN_SAMPLES", "2"))
 
     emb_array = np.array(embeddings, dtype=np.float32)
     n_samples = emb_array.shape[0]
@@ -120,15 +120,23 @@ def cluster_embeddings(
         n_neighbors=n_neighbors,
     )
 
+    cluster_selection_method = os.getenv("HDBSCAN_CLUSTER_SELECTION_METHOD", "eom").strip().lower()
+    if cluster_selection_method not in {"eom", "leaf"}:
+        LOGGER.warning(
+            "Invalid HDBSCAN_CLUSTER_SELECTION_METHOD=%s; using eom",
+            cluster_selection_method,
+        )
+        cluster_selection_method = "eom"
+
     LOGGER.info(
-        "Running HDBSCAN (min_cluster_size=%d, min_samples=%d)...",
-        min_cluster_size, min_samples,
+        "Running HDBSCAN (min_cluster_size=%d, min_samples=%d, method=%s)...",
+        min_cluster_size, min_samples, cluster_selection_method,
     )
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
         metric="euclidean",
-        cluster_selection_method="leaf",  # Finer-grained clusters
+        cluster_selection_method=cluster_selection_method,
     )
     labels = clusterer.fit_predict(reduced)
 

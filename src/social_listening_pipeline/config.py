@@ -49,7 +49,7 @@ class Settings:
     data_raw_dir: Path = field(default_factory=lambda: _env_path("DATA_RAW_DIR", "data/raw"))
     data_processed_dir: Path = field(default_factory=lambda: _env_path("DATA_PROCESSED_DIR", "data/processed"))
     reports_dir: Path = field(default_factory=lambda: _env_path("REPORTS_DIR", "data/reports"))
-    sentiment_method: str = field(default_factory=lambda: os.getenv("SENTIMENT_METHOD", "hybrid").lower())
+    sentiment_method: str = field(default_factory=lambda: os.getenv("SENTIMENT_METHOD", "transformer").lower())
     sentiment_model_name: str = field(
         default_factory=lambda: os.getenv(
             "SENTIMENT_MODEL_NAME",

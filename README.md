@@ -1,216 +1,264 @@
 # Social Listening Pipeline
 
-Clean Python project scaffold for building a social listening pipeline to analyze X posts for clustering and topic extraction.
+Python pipeline for scraping, preprocessing, clustering, topic extraction, sentiment analysis, and marketing-oriented reporting for social listening data.
 
-## Current scope
+## Current Pipeline
 
-- Project structure and packaging
-- CLI entry point
-- Centralized logging setup
-- Config handling via environment variables
-- Yahoo realtime raw collector
-- Modular preprocessing (deduplication, language detection, text cleaning)
-- Analysis pipeline (embeddings, clustering, LLM topic labeling, transformer sentiment)
-- Reporting pipeline (markdown/html/csv outputs for marketing)
+```text
+Posts
+|
+Preprocess posts for clustering
+|
+Transformer sentiment per post -> Sentiment_Transformer
+|
+Embeddings
+|
+UMAP + HDBSCAN clustering
+|
+c-TF-IDF keywords per cluster
+|
+LLM batches inside each cluster -> Sentiment_LLM + raw post topics
+|
+Algorithmic topic consolidation inside each cluster
+|
+Second LLM topic consolidation -> compact canonical taxonomy
+|
+Attach canonical topics back to posts
+|
+Final LLM marketing call
+|
+clusters.json, analysis.json, structured_output.json, report files
+```
 
-> Note: scraper and preprocessing are implemented. Cluster topic labeling uses LLM structured JSON output when an API key is set. Post-level sentiment defaults to a fine-tuned Hugging Face transformer, with optional LLM review for ambiguous Japanese fandom/SNS slang.
+The two sentiment fields mean different things:
 
-## Quickstart
+- `Sentiment_Transformer`: local Hugging Face model sentiment.
+- `Sentiment_LLM`: engagement/favorability label from the LLM. `positive` means the user is engaged or favorable; `negative` means clear criticism/rejection; `neutral` means unclear or informational.
+
+## Main Modules
+
+- `collector.yahoo_realtime`: Yahoo realtime scraper.
+- `preprocessing.pipeline`: raw JSONL cleaning, deduplication, language metadata.
+- `analysis.sentiment_transformer`: Hugging Face transformer sentiment.
+- `analysis.embeddings`: multilingual semantic embeddings with `BAAI/bge-m3` by default.
+- `analysis.clustering`: UMAP + HDBSCAN clustering and UMAP visualization coordinates. Defaults are `HDBSCAN_MIN_CLUSTER_SIZE=6`, `HDBSCAN_MIN_SAMPLES=2`, and `HDBSCAN_CLUSTER_SELECTION_METHOD=eom`.
+- `analysis.text_preparation`: title/noise stripping, light reply/handle/decorative-token filtering, c-TF-IDF keyword extraction, representative posts.
+- `analysis.post_llm_annotation`: LLM post batches, second LLM topic-taxonomy refinement, and final marketing summary.
+- `analysis.topic_consolidation`: first-pass canonical topic IDs/labels per cluster using normalized labels plus embedding/lexical similarity.
+- `analysis.structured_output`: Shiny/QueryChat-friendly JSON output.
+
+## Topic Consolidation
+
+Topic extraction has two stages:
+
+1. First pass: each post can receive up to 3 raw topics from the LLM. The algorithm groups similar raw labels inside the same cluster.
+2. Second pass: an LLM receives the preliminary topics for one cluster, not all posts, with topic counts, sentiment counts, aliases, keywords, and a few examples. It returns up to `LLM_TOPIC_CONSOLIDATION_MAX_TOPICS` final topics and lists which preliminary `source_topic_ids` should be merged into each final topic.
+
+This keeps token usage lower than re-reading every post while reducing noisy micro-topics. The final `topics` in `structured_output.json` are the second-pass canonical taxonomy. Each final topic keeps `source_topic_ids` for traceability.
+
+## Setup
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-social-listening --help
 ```
 
-## Analysis architecture
+On Windows PowerShell, activate with:
 
-```text
-Posts
-↓
-Embeddings
-↓
-UMAP
-↓
-HDBSCAN
-↓
-LLM topic labeling per cluster
-↓
-Transformer sentiment per post
-↓
-LLM fallback for ambiguous cases
-↓
-Cluster-level sentiment aggregation
-↓
-Final report
+```powershell
+.\.venv\Scripts\Activate.ps1
+pip install -e .
 ```
 
-Topic labeling and sentiment analysis are separate responsibilities:
+## LLM Provider
 
-- `analysis.topic_labeling.TopicLabeler` labels only cluster topics with an LLM.
-- `analysis.sentiment_transformer.TransformerSentimentAnalyzer` classifies each post with a fine-tuned transformer model.
-- `analysis.sentiment_transformer.LLMSentimentReviewer` is used only as a fallback/reviewer in hybrid mode.
+OpenAI:
 
-The transformer model is already fine-tuned for sentiment analysis. You do not need to train a model at this stage.
-
-### Yahoo realtime scraper runtime requirements
-
-The Yahoo realtime scraper uses Selenium + headless Chrome. Install browser dependencies before scraping:
-
-```bash
-sudo apt update
-sudo apt install -y chromium chromium-driver
+```powershell
+$env:LLM_PROVIDER="openai"
+$env:OPENAI_API_KEY="your_key"
+$env:TOPIC_LABELING_MODEL="gpt-4.1-mini"
 ```
 
-Validate browser wiring before scraping:
+Gemini:
 
-```bash
-python cli.py scrape --check-chrome
+```powershell
+$env:LLM_PROVIDER="gemini"
+$env:GEMINI_API_KEY="your_key"
+$env:GEMINI_MODEL="gemini-2.5-flash"
+$env:TOPIC_LABELING_MODEL="gemini-2.5-flash"
 ```
 
-## Run Yahoo realtime scraper
+## Sentiment And LLM Settings
 
-```bash
-yahoo-realtime-scrape --keywords "openai" "ai safety" --max-posts 50 --max-scrolls 5
+Default transformer model:
+
+```powershell
+$env:SENTIMENT_MODEL_NAME="LoneWolfgang/bert-for-japanese-twitter-sentiment"
 ```
 
-Output is written to `data/raw/yahoo_realtime_<timestamp>.jsonl`.
+LLM batch/config controls:
 
-## Run preprocessing
-
-```bash
-preprocess-posts --input data/raw/yahoo_realtime_<timestamp>.jsonl --output-dir data/processed
+```powershell
+$env:POST_TOPIC_LLM_BATCH_SIZE="15"
+$env:LLM_TOPIC_CONSOLIDATION_MAX_TOPICS="6"
+$env:LLM_TOPIC_CONSOLIDATION_MAX_INPUT_TOPICS="40"
+$env:LLM_TEMPERATURE="0"
+$env:LLM_TOP_P="1"
+$env:GEMINI_THINKING_BUDGET="0"
 ```
 
-Output is written to `data/processed/<input_name>_processed.jsonl`.
+The LLM post-batch call returns only:
 
+- `source_row_index`
+- `sentiment_llm`
+- `topics`, max 3 per post, each with `topic_label` and `topic_description`
 
-## LLM provider configuration
+It does not return sentiment rationales.
 
-Topic labeling and optional sentiment review support two providers:
+Clustering controls:
 
-- OpenAI (default): set `OPENAI_API_KEY`
-- Google Gemini: set `LLM_PROVIDER=gemini` and `GEMINI_API_KEY`
+```powershell
+$env:HDBSCAN_MIN_CLUSTER_SIZE="6"
+$env:HDBSCAN_MIN_SAMPLES="2"
+$env:HDBSCAN_CLUSTER_SELECTION_METHOD="eom"
+```
 
-Example (Gemini):
+## Run The Pipeline
 
-```bash
-export LLM_PROVIDER=gemini
-export GEMINI_API_KEY="your_key"
-export GEMINI_MODEL="gemini-2.5-flash"
-export TOPIC_LABELING_MODEL="gemini-2.5-flash"
+Scrape:
+
+```powershell
+python cli.py scrape --keywords "おっさんずラブ"
+```
+
+Preprocess latest raw file:
+
+```powershell
+python cli.py preprocess
+```
+
+Analyze latest processed file:
+
+```powershell
 python cli.py analyze
+```
+
+Analyze a specific processed JSONL file with free-tier settings:
+
+```powershell
+cd C:\Users\MANUE\Desktop\Scrapping
+$env:LLM_PROVIDER="gemini"
+$env:GEMINI_API_KEY="your_gemini_key_here"
+$env:GEMINI_MODEL="gemini-2.5-flash"
+$env:TOPIC_LABELING_MODEL="gemini-2.5-flash"
+python cli.py analyze --free --input "data/processed/YOUR_FILE_processed.jsonl"
+```
+
+If the file is in the project root:
+
+```powershell
+python cli.py analyze --free --input ".\YOUR_FILE_processed.jsonl"
+```
+
+Generate report files:
+
+```powershell
 python cli.py report
 ```
 
-## Sentiment configuration
+## Free-Tier Mode
 
-Set `SENTIMENT_METHOD` to choose how post-level sentiment is calculated:
+`python cli.py analyze --free` sets conservative defaults if they are not already set:
 
-- `llm`: legacy LLM sentiment behavior for backward compatibility.
-- `transformer`: classify every post with the Hugging Face transformer.
-- `hybrid`: run the transformer first, then send low-confidence or ambiguous slang posts to the LLM reviewer.
+- `POST_TOPIC_LLM_BATCH_SIZE=15`
+- `LLM_TOPIC_CONSOLIDATION_MAX_TOPICS=6`
+- `LLM_TOPIC_CONSOLIDATION_MAX_INPUT_TOPICS=40`
+- `HDBSCAN_MIN_CLUSTER_SIZE=6`
+- `HDBSCAN_MIN_SAMPLES=2`
+- `HDBSCAN_CLUSTER_SELECTION_METHOD=eom`
+- `GEMINI_REQUESTS_PER_MINUTE=10`
+- `GEMINI_TOKENS_PER_MINUTE=250000`
+- `GEMINI_REQUESTS_PER_DAY=250`
+- `GEMINI_MIN_SECONDS_BETWEEN_REQUESTS=6`
+- `GEMINI_THINKING_BUDGET=0`
+- `LLM_TEMPERATURE=0`
+- `LLM_TOP_P=1`
 
-Default settings:
+The shared limiter stores its local daily counter at:
 
-```bash
-export SENTIMENT_METHOD=hybrid
-export SENTIMENT_MODEL_NAME=LoneWolfgang/bert-for-japanese-twitter-sentiment
-export SENTIMENT_CONFIDENCE_THRESHOLD=0.70
-export ENABLE_LLM_SENTIMENT_FALLBACK=true
-export SENTIMENT_LLM_FALLBACK_BATCH_SIZE=25
-export SENTIMENT_LLM_REVIEW_DELAY_SECONDS=0
-export TOPIC_LABELING_MODEL=gpt-4.1-mini
-export TOPIC_LABELING_DELAY_SECONDS=0
-export TOPIC_LABELING_429_COOLDOWN_SECONDS=60
-export LLM_TEMPERATURE=0
-export GEMINI_THINKING_BUDGET=0
+```text
+data/reports/llm_rate_limit_state.json
 ```
 
-The default sentiment model is Japanese Twitter sentiment:
+## Outputs
 
-```bash
-export SENTIMENT_MODEL_NAME=LoneWolfgang/bert-for-japanese-twitter-sentiment
+The main dashboard file is:
+
+```text
+data/reports/structured_output.json
 ```
 
-The transformer output is normalized to `positive`, `neutral`, and `negative`. `LoneWolfgang/bert-for-japanese-twitter-sentiment` uses `0 -> negative`, `1 -> neutral`, and `2 -> positive`; the pipeline also maps `LABEL_0`, `LABEL_1`, and `LABEL_2` the same way. Star-rating or "very positive/negative" labels from other models are folded into the same three labels. LLM sentiment review returns only the sentiment label to reduce token usage; sentiment rationales are written as `null` in the structured dashboard output.
-
-## Run analysis
-
-```bash
-run-analysis --input data/processed/<input_name>_processed.jsonl --output-dir data/reports
-```
-
-For free-tier API limits, use conservative batching and longer delays:
-
-```bash
-python cli.py analyze --free
-```
-
-`--free` enables Gemini free-tier protection while preserving any sentiment method you explicitly set. By default it uses hybrid sentiment, batches LLM sentiment review in groups of 25, caps fallback reviews at 30 posts, lowers the low-confidence fallback threshold to `0.55`, and uses a shared local limiter for Gemini requests.
-
-To run full legacy LLM sentiment under the same free-tier limiter:
-
-```bash
-export SENTIMENT_METHOD=llm
-export LLM_PROVIDER=gemini
-export GEMINI_API_KEY="your_key"
-python cli.py analyze --free
-```
-
-The Gemini limiter defaults to 10 requests/minute, 250,000 estimated tokens/minute, and 250 requests/day. The local daily counter is stored in `data/reports/llm_rate_limit_state.json`.
-For Gemini 2.5 Flash, `--free` also sets `GEMINI_THINKING_BUDGET=0` unless you override it, which disables thinking tokens for cheaper/faster label-only calls.
-
-Outputs:
-- `data/reports/clusters.json`
-- `data/reports/analysis.json`
-- `data/reports/structured_output.json`
-
-`analysis.json` includes cluster topic fields plus sentiment aggregated from individual posts:
+Top-level shape:
 
 ```json
 {
-  "cluster_id": 0,
-  "topic_label": "ドラマSeason2への期待",
-  "topic_summary": "続編やキャスト続投への期待を表す投稿が中心。",
-  "sentiment_distribution": {
-    "positive": 0.72,
-    "neutral": 0.21,
-    "negative": 0.07
-  },
-  "dominant_sentiment": "positive"
+  "metadata": {},
+  "posts": [],
+  "clusters": [],
+  "daily_topic_metrics": [],
+  "report_summary": {}
 }
 ```
 
-## Sentiment demo
+Important post fields:
 
-```bash
-python examples/test_hybrid_sentiment.py
+```json
+{
+  "source_row_index": 0,
+  "text": "Original post text",
+  "cleaned_text": "Cleaned post text",
+  "cluster_id": 2,
+  "Sentiment_Transformer": "neutral",
+  "Sentiment_LLM": "positive",
+  "raw_topics_llm": [],
+  "topics": [],
+  "topic_id": "t003",
+  "topic_label": "S2期待",
+  "topic_description": "続編への期待",
+  "umap_x": 1.23,
+  "umap_y": -0.44
+}
 ```
 
-The demo prints the transformer label, confidence, whether LLM fallback was triggered, and the final sentiment for a few Japanese posts.
+Important cluster fields:
 
-## Run reporting
-
-```bash
-generate-report --clusters data/reports/clusters.json --analysis data/reports/analysis.json --output-dir data/reports
+```json
+{
+  "cluster_id": 2,
+  "topic_id": "t003",
+  "topic_label": "S2期待",
+  "topics": [],
+  "positive_count": 14,
+  "neutral_count": 25,
+  "negative_count": 3,
+  "sentiment_llm_counts": {},
+  "sentiment_transformer_counts": {},
+  "top_keywords": ["Hulu", "配信", "放送"],
+  "marketing_interpretation": "What this topic means",
+  "risk_level": "low",
+  "opportunity_level": "medium",
+  "recommended_actions": [],
+  "umap_centroid_x": 0.12,
+  "umap_centroid_y": -0.08
+}
 ```
 
-Outputs:
+Other files:
+
+- `data/reports/clusters.json`
+- `data/reports/analysis.json`
 - `data/reports/report.md`
 - `data/reports/report.html`
 - `data/reports/clusters.csv`
-
-`structured_output.json` is designed for dashboard/shiny consumption. It contains top-level `metadata`, `posts`, `clusters`, `daily_topic_metrics`, and `report_summary` sections. Each post includes its cluster/topic assignment, sentiment, representative-post flag, and `umap_x`/`umap_y` coordinates for cluster visualization.
-
-## Unified CLI
-
-You can also run the whole pipeline from the repository root:
-
-```bash
-python cli.py scrape --keywords "openai"
-python cli.py preprocess
-python cli.py analyze
-python cli.py report
-```

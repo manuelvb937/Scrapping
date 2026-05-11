@@ -30,6 +30,21 @@ def latest_file(directory: Path, pattern: str) -> Path | None:
     return files[0] if files else None
 
 
+def resolve_input_path(value: str | None, fallback_dir: str | Path, pattern: str) -> Path | None:
+    if not value:
+        return latest_file(Path(fallback_dir), pattern)
+
+    input_path = Path(value)
+    if input_path.exists() or input_path.is_absolute():
+        return input_path
+
+    fallback_path = Path(fallback_dir) / input_path
+    if fallback_path.exists():
+        return fallback_path
+
+    return input_path
+
+
 def command_scrape(args: argparse.Namespace) -> None:
     if args.check_chrome:
         ok, message = smoke_test_chrome_driver()
@@ -47,7 +62,7 @@ def command_scrape(args: argparse.Namespace) -> None:
 
 
 def command_preprocess(args: argparse.Namespace) -> None:
-    input_path = Path(args.input) if args.input else latest_file(Path(args.raw_dir), "*.jsonl")
+    input_path = resolve_input_path(args.input, args.raw_dir, "*.jsonl")
     if input_path is None:
         raise FileNotFoundError(f"No raw JSONL files found in {args.raw_dir}")
 
@@ -59,7 +74,7 @@ def command_analyze(args: argparse.Namespace) -> None:
     if args.free:
         apply_free_mode_defaults()
 
-    input_path = Path(args.input) if args.input else latest_file(Path(args.processed_dir), "*.jsonl")
+    input_path = resolve_input_path(args.input, args.processed_dir, "*.jsonl")
     if input_path is None:
         raise FileNotFoundError(f"No processed JSONL files found in {args.processed_dir}")
 
@@ -86,7 +101,7 @@ def command_report(args: argparse.Namespace) -> None:
 
 
 def command_export(args: argparse.Namespace) -> None:
-    input_path = Path(args.input) if args.input else latest_file(Path(args.processed_dir), "*.jsonl")
+    input_path = resolve_input_path(args.input, args.processed_dir, "*.jsonl")
     if input_path is None:
         raise FileNotFoundError(f"No processed JSONL files found in {args.processed_dir}")
 
