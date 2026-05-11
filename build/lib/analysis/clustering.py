@@ -34,8 +34,6 @@ class ClusterDiagnostics:
     noise_count: int
     total_posts: int
     warning: str | None = None
-    umap_coordinates: list[list[float]] = field(default_factory=list)
-    coordinate_method: str = "umap_2d"
 
 
 def cluster_embeddings(
@@ -90,8 +88,6 @@ def cluster_embeddings(
             largest_cluster_ratio=max_ratio,
             noise_count=0,
             total_posts=n_samples,
-            umap_coordinates=_fallback_embedding_coordinates(emb_array),
-            coordinate_method="embedding_projection_fallback",
         )
         return clusters, diag
 
@@ -114,11 +110,6 @@ def cluster_embeddings(
         min_dist=0.0,  # Allow tighter clusters in UMAP space
     )
     reduced = reducer.fit_transform(emb_array)
-    visualization_coordinates = _build_umap_visualization_coordinates(
-        emb_array,
-        reduced,
-        n_neighbors=n_neighbors,
-    )
 
     LOGGER.info(
         "Running HDBSCAN (min_cluster_size=%d, min_samples=%d)...",
@@ -177,8 +168,6 @@ def cluster_embeddings(
         noise_count=len(noise_indices),
         total_posts=n_samples,
         warning=warning,
-        umap_coordinates=visualization_coordinates,
-        coordinate_method="umap_2d",
     )
 
     LOGGER.info(
@@ -187,50 +176,6 @@ def cluster_embeddings(
     )
 
     return clusters, diag
-
-
-def _build_umap_visualization_coordinates(
-    emb_array: np.ndarray,
-    reduced: np.ndarray,
-    *,
-    n_neighbors: int,
-) -> list[list[float]]:
-    """Return 2D coordinates for visualization, aligned with input embeddings."""
-    if reduced.shape[1] == 2:
-        return _round_coordinates(reduced)
-
-    try:
-        import umap
-
-        reducer = umap.UMAP(
-            n_components=2,
-            metric="cosine",
-            random_state=42,
-            n_neighbors=n_neighbors,
-            min_dist=0.0,
-        )
-        return _round_coordinates(reducer.fit_transform(emb_array))
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Could not build 2D UMAP coordinates, using first reduced dimensions: %s", exc)
-        return _round_coordinates(reduced[:, :2])
-
-
-def _fallback_embedding_coordinates(emb_array: np.ndarray) -> list[list[float]]:
-    """Small-dataset visualization fallback when UMAP is intentionally skipped."""
-    if emb_array.size == 0:
-        return []
-    if emb_array.shape[1] == 1:
-        coords = np.column_stack([emb_array[:, 0], np.zeros(emb_array.shape[0])])
-    else:
-        coords = emb_array[:, :2]
-    return _round_coordinates(coords)
-
-
-def _round_coordinates(coords: np.ndarray) -> list[list[float]]:
-    return [
-        [round(float(row[0]), 6), round(float(row[1]), 6)]
-        for row in coords
-    ]
 
 
 # --- Legacy greedy clustering (kept for comparison) ---

@@ -17,8 +17,6 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from analysis.llm_rate_limit import limited_llm_call
-
 LOGGER = logging.getLogger(__name__)
 SENTIMENT_VALUES = ("positive", "neutral", "negative")
 
@@ -215,15 +213,6 @@ def _call_gemini_strategy(labeler, prompt: str) -> str:
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": _env_float("LLM_TEMPERATURE", 0.0),
-            "topP": _env_float("LLM_TOP_P", 1.0),
-            "candidateCount": 1,
-            "maxOutputTokens": _env_int("LLM_STRATEGY_MAX_OUTPUT_TOKENS", 4096),
-            "thinkingConfig": {
-                "thinkingBudget": _env_int("GEMINI_THINKING_BUDGET", 0),
-            },
-        },
     }
 
     params = urlencode({"key": labeler.gemini_api_key})
@@ -235,17 +224,8 @@ def _call_gemini_strategy(labeler, prompt: str) -> str:
         method="POST",
     )
 
-    def send_request() -> dict:
-        with urlopen(request, timeout=90) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    body = limited_llm_call(
-        labeler.provider,
-        labeler.model,
-        "marketing strategy generation",
-        prompt,
-        send_request,
-    )
+    with urlopen(request, timeout=90) as response:
+        body = json.loads(response.read().decode("utf-8"))
 
     candidates = body.get("candidates", [])
     for candidate in candidates:
@@ -263,8 +243,6 @@ def _call_openai_strategy(labeler, prompt: str) -> str:
 
     payload = {
         "model": labeler.model,
-        "temperature": _env_float("LLM_TEMPERATURE", 0.0),
-        "top_p": _env_float("LLM_TOP_P", 1.0),
         "input": [
             {
                 "role": "user",
@@ -283,17 +261,8 @@ def _call_openai_strategy(labeler, prompt: str) -> str:
         method="POST",
     )
 
-    def send_request() -> dict:
-        with urlopen(request, timeout=90) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    body = limited_llm_call(
-        labeler.provider,
-        labeler.model,
-        "marketing strategy generation",
-        prompt,
-        send_request,
-    )
+    with urlopen(request, timeout=90) as response:
+        body = json.loads(response.read().decode("utf-8"))
 
     output = body.get("output", [])
     for entry in output:
@@ -497,26 +466,6 @@ def markdown_to_html(markdown: str) -> str:
 def _bold_to_html(text: str) -> str:
     """Convert **bold** markdown to <strong> HTML tags."""
     return re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
-
-
-def _env_int(name: str, default: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        return int(raw_value)
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        return float(raw_value)
-    except ValueError:
-        return default
 
 
 def generate_reports(

@@ -20,8 +20,6 @@ from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .llm_rate_limit import limited_llm_call
-
 LOGGER = logging.getLogger(__name__)
 SENTIMENT_VALUES = {"positive", "negative", "neutral"}
 
@@ -131,7 +129,7 @@ class LLMTopicSentimentLabeler:
         missing_key = "GEMINI_API_KEY" if self.provider == "gemini" else "OPENAI_API_KEY"
         return self._heuristic_analysis(cluster_id, texts, missing_key=missing_key)
 
-    def analyze_posts_batch(self, texts: list[str], batch_size: int | None = None) -> list[PostSentiment]:
+    def analyze_posts_batch(self, texts: list[str], batch_size: int = 50) -> list[PostSentiment]:
         """Analyze sentiment for individual posts in batches.
 
         Improvement #4: Per-post sentiment analysis via LLM batch calls.
@@ -141,13 +139,6 @@ class LLMTopicSentimentLabeler:
         """
         if not texts:
             return []
-
-        if batch_size is None:
-            batch_size = _env_int(
-                "LLM_SENTIMENT_BATCH_SIZE",
-                _env_int("SENTIMENT_LLM_BATCH_SIZE", 25),
-            )
-        batch_size = max(1, batch_size)
 
         has_api = (
             (self.provider == "gemini" and self.gemini_api_key)
@@ -183,9 +174,9 @@ class LLMTopicSentimentLabeler:
                     sentiment = self._heuristic_sentiment(text)
                     all_sentiments.append(PostSentiment(index=i, sentiment=sentiment))
 
-            extra_delay = _env_float("SENTIMENT_LLM_BATCH_DELAY_SECONDS", 0.0)
-            if has_api and extra_delay > 0:
-                time.sleep(extra_delay)
+            # Delay between batch LLM calls to stay under API rate limits
+            if has_api:
+                time.sleep(10.0)
 
         return all_sentiments
 
@@ -202,9 +193,6 @@ class LLMTopicSentimentLabeler:
     def _batch_sentiment_openai(self, numbered_posts: str) -> list[dict[str, Any]]:
         payload = {
             "model": self.model,
-            "temperature": _env_float("LLM_TEMPERATURE", 0.0),
-            "top_p": _env_float("LLM_TOP_P", 1.0),
-            "max_output_tokens": _env_int("LLM_SENTIMENT_MAX_OUTPUT_TOKENS", 1024),
             "input": [
                 {
                     "role": "system",
@@ -256,17 +244,8 @@ class LLMTopicSentimentLabeler:
             method="POST",
         )
 
-        def send_request() -> dict[str, Any]:
-            with urlopen(request, timeout=120) as response:
-                return json.loads(response.read().decode("utf-8"))
-
-        body = limited_llm_call(
-            self.provider,
-            self.model,
-            "legacy LLM sentiment batch",
-            POST_SENTIMENT_SYSTEM_PROMPT + "\n\n" + numbered_posts,
-            send_request,
-        )
+        with urlopen(request, timeout=120) as response:
+            body = json.loads(response.read().decode("utf-8"))
 
         parsed = self._extract_openai_structured_json(body)
         return parsed.get("sentiments", [])
@@ -278,13 +257,6 @@ class LLMTopicSentimentLabeler:
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "temperature": _env_float("LLM_TEMPERATURE", 0.0),
-                "topP": _env_float("LLM_TOP_P", 1.0),
-                "candidateCount": 1,
-                "maxOutputTokens": _env_int("LLM_SENTIMENT_MAX_OUTPUT_TOKENS", 1024),
-                "thinkingConfig": {
-                    "thinkingBudget": _env_int("GEMINI_THINKING_BUDGET", 0),
-                },
                 "responseSchema": {
                     "type": "OBJECT",
                     "properties": {
@@ -317,17 +289,8 @@ class LLMTopicSentimentLabeler:
             method="POST",
         )
 
-        def send_request() -> dict[str, Any]:
-            with urlopen(request, timeout=120) as response:
-                return json.loads(response.read().decode("utf-8"))
-
-        body = limited_llm_call(
-            self.provider,
-            self.model,
-            "legacy LLM sentiment batch",
-            prompt,
-            send_request,
-        )
+        with urlopen(request, timeout=120) as response:
+            body = json.loads(response.read().decode("utf-8"))
 
         parsed = self._extract_gemini_structured_json(body)
         return parsed.get("sentiments", [])
@@ -342,8 +305,6 @@ class LLMTopicSentimentLabeler:
         user_content = self._build_cluster_user_prompt(texts, top_keywords, search_terms=search_terms)
         payload = {
             "model": self.model,
-            "temperature": _env_float("LLM_TEMPERATURE", 0.0),
-            "top_p": _env_float("LLM_TOP_P", 1.0),
             "input": [
                 {
                     "role": "system",
@@ -393,17 +354,8 @@ class LLMTopicSentimentLabeler:
             method="POST",
         )
 
-        def send_request() -> dict[str, Any]:
-            with urlopen(request, timeout=60) as response:
-                return json.loads(response.read().decode("utf-8"))
-
-        body = limited_llm_call(
-            self.provider,
-            self.model,
-            "legacy cluster analysis",
-            CLUSTER_SYSTEM_PROMPT + "\n\n" + user_content,
-            send_request,
-        )
+        with urlopen(request, timeout=60) as response:
+            body = json.loads(response.read().decode("utf-8"))
 
         return self._extract_openai_structured_json(body)
 
@@ -421,13 +373,6 @@ class LLMTopicSentimentLabeler:
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "temperature": _env_float("LLM_TEMPERATURE", 0.0),
-                "topP": _env_float("LLM_TOP_P", 1.0),
-                "candidateCount": 1,
-                "maxOutputTokens": _env_int("LLM_TOPIC_MAX_OUTPUT_TOKENS", 1024),
-                "thinkingConfig": {
-                    "thinkingBudget": _env_int("GEMINI_THINKING_BUDGET", 0),
-                },
                 "responseSchema": {
                     "type": "OBJECT",
                     "properties": {
@@ -449,17 +394,8 @@ class LLMTopicSentimentLabeler:
             method="POST",
         )
 
-        def send_request() -> dict[str, Any]:
-            with urlopen(request, timeout=60) as response:
-                return json.loads(response.read().decode("utf-8"))
-
-        body = limited_llm_call(
-            self.provider,
-            self.model,
-            "legacy cluster analysis",
-            prompt,
-            send_request,
-        )
+        with urlopen(request, timeout=60) as response:
+            body = json.loads(response.read().decode("utf-8"))
 
         return self._extract_gemini_structured_json(body)
 
@@ -627,23 +563,3 @@ class LLMTopicSentimentLabeler:
         if provider == "gemini":
             return os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         return os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-
-
-def _env_int(name: str, default: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        return int(raw_value)
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        return float(raw_value)
-    except ValueError:
-        return default

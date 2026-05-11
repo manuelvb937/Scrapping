@@ -18,6 +18,13 @@ def test_build_parser_supports_required_commands() -> None:
         assert args.command == command
 
 
+def test_analyze_supports_free_flag() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["analyze", "--free"])
+    assert args.command == "analyze"
+    assert args.free is True
+
+
 def test_latest_file_returns_most_recent(tmp_path: Path) -> None:
     older = tmp_path / "a.jsonl"
     newer = tmp_path / "b.jsonl"

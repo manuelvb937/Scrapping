@@ -53,7 +53,7 @@ class Settings:
     sentiment_model_name: str = field(
         default_factory=lambda: os.getenv(
             "SENTIMENT_MODEL_NAME",
-            "LoneWolfgang/bert-for-japanese-twitter-sentiment",
+            "cardiffnlp/twitter-xlm-roberta-base-sentiment",
         )
     )
     sentiment_confidence_threshold: float = field(

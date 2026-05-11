@@ -1,0 +1,293 @@
+Social Listening Pipeline Command Cheatsheet
+===========================================
+
+Run these commands from the project root:
+
+  C:\Users\MANUE\Desktop\Scrapping
+
+
+Basic Full Pipeline
+-------------------
+
+Scrape posts:
+
+  python cli.py scrape --keywords "openai"
+
+Preprocess the latest scraped file:
+
+  python cli.py preprocess
+
+Analyze the latest processed file:
+
+  python cli.py analyze
+
+Analyze with free-tier API protections:
+
+  python cli.py analyze --free
+
+Generate markdown/html/csv report:
+
+  python cli.py report
+
+Export processed posts to browser-viewable HTML:
+
+  python cli.py export
+
+
+No LLM Mode: Transformer Sentiment Only
+---------------------------------------
+
+Use this when you want to see the pipeline work without sending sentiment posts
+to an LLM. Topic labeling will also fall back to a simple heuristic if no LLM API
+keys are set.
+
+PowerShell:
+
+  Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
+  Remove-Item Env:GEMINI_API_KEY -ErrorAction SilentlyContinue
+  $env:SENTIMENT_METHOD="transformer"
+  $env:ENABLE_LLM_SENTIMENT_FALLBACK="false"
+  python cli.py analyze
+  python cli.py report
+
+Notes:
+
+  - This uses Hugging Face transformer sentiment.
+  - The default model is:
+    LoneWolfgang/bert-for-japanese-twitter-sentiment
+  - The first run may download the model.
+  - No model training is needed.
+
+
+No LLM and No Transformer Download: Heuristic Fallback
+------------------------------------------------------
+
+Use this only for a quick smoke test if you do not want LLM calls or transformer
+model downloads. It uses the legacy keyword heuristic fallback.
+
+PowerShell:
+
+  Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
+  Remove-Item Env:GEMINI_API_KEY -ErrorAction SilentlyContinue
+  $env:SENTIMENT_METHOD="llm"
+  python cli.py analyze
+  python cli.py report
+
+
+Transformer-Only Sentiment
+--------------------------
+
+PowerShell:
+
+  $env:SENTIMENT_METHOD="transformer"
+  $env:SENTIMENT_MODEL_NAME="LoneWolfgang/bert-for-japanese-twitter-sentiment"
+  python cli.py analyze
+
+Alternative multilingual model:
+
+  $env:SENTIMENT_MODEL_NAME="cardiffnlp/twitter-xlm-roberta-base-sentiment"
+
+
+Hybrid Sentiment: Transformer First, LLM Only for Ambiguous Posts
+-----------------------------------------------------------------
+
+PowerShell:
+
+  $env:SENTIMENT_METHOD="hybrid"
+  $env:SENTIMENT_MODEL_NAME="LoneWolfgang/bert-for-japanese-twitter-sentiment"
+  $env:SENTIMENT_CONFIDENCE_THRESHOLD="0.70"
+  $env:ENABLE_LLM_SENTIMENT_FALLBACK="true"
+  $env:SENTIMENT_LLM_FALLBACK_BATCH_SIZE="25"
+  $env:SENTIMENT_LLM_REVIEW_DELAY_SECONDS="0"
+  python cli.py analyze
+
+Hybrid sends a post to the LLM only when:
+
+  - transformer confidence is below SENTIMENT_CONFIDENCE_THRESHOLD
+  - or the post contains Japanese fandom/slang ambiguity markers such as:
+    しんどい, 死んだ, やばい, 草, 沼, 尊い, 供給, 無理, 泣いた, えぐい, 最高だけど, 微妙
+
+If Gemini/OpenAI returns HTTP 429 Too Many Requests, increase:
+
+  $env:SENTIMENT_LLM_REVIEW_DELAY_SECONDS="20"
+
+Or disable sentiment fallback for a transformer-only run:
+
+  $env:ENABLE_LLM_SENTIMENT_FALLBACK="false"
+
+
+Analyze --free Mode
+-------------------
+
+This is the easiest mode for Gemini/OpenAI free tiers:
+
+  python cli.py analyze --free
+
+It sets these conservative defaults only when you have not already set the
+same environment variable:
+
+  SENTIMENT_METHOD=hybrid
+  ENABLE_LLM_SENTIMENT_FALLBACK=true
+  SENTIMENT_CONFIDENCE_THRESHOLD=0.55
+  SENTIMENT_LLM_FALLBACK_BATCH_SIZE=25
+  LLM_SENTIMENT_BATCH_SIZE=25
+  SENTIMENT_LLM_MAX_REVIEWS=30
+  SENTIMENT_LLM_REVIEW_DELAY_SECONDS=0
+  TOPIC_LABELING_DELAY_SECONDS=0
+  TOPIC_LABELING_429_COOLDOWN_SECONDS=120
+  GEMINI_FREE_TIER_LIMITING=true
+  GEMINI_REQUESTS_PER_MINUTE=10
+  GEMINI_TOKENS_PER_MINUTE=250000
+  GEMINI_REQUESTS_PER_DAY=250
+  GEMINI_MIN_SECONDS_BETWEEN_REQUESTS=6
+  GEMINI_THINKING_BUDGET=0
+  LLM_TEMPERATURE=0
+
+Meaning:
+
+  - Transformer still analyzes every post.
+  - Only very low-confidence or ambiguous posts go to the LLM.
+  - LLM sentiment fallback is sent in batches of 25 posts per request.
+  - LLM sentiment review asks for labels only, no rationales.
+  - At most 30 posts are sent to LLM sentiment review.
+  - Gemini calls are paced by a shared request/token/day limiter.
+  - Gemini 2.5 Flash thinking tokens are disabled by default.
+
+To use full legacy LLM sentiment with the same limiter:
+
+  $env:SENTIMENT_METHOD="llm"
+  $env:LLM_PROVIDER="gemini"
+  python cli.py analyze --free
+
+
+Specific File: Free-Tier Gemini Analysis
+----------------------------------------
+
+Use this when you already have a processed JSONL file and want to analyze that
+specific file instead of the latest file in data/processed.
+
+PowerShell, hybrid mode:
+
+  cd C:\Users\MANUE\Desktop\Scrapping
+  $env:LLM_PROVIDER="gemini"
+  $env:GEMINI_API_KEY="your_gemini_key_here"
+  $env:GEMINI_MODEL="gemini-2.5-flash"
+  $env:TOPIC_LABELING_MODEL="gemini-2.5-flash"
+  $env:SENTIMENT_METHOD="hybrid"
+  python cli.py analyze --free --input "data/processed/YOUR_FILE_processed.jsonl"
+  python cli.py report
+
+PowerShell, full LLM sentiment mode:
+
+  cd C:\Users\MANUE\Desktop\Scrapping
+  $env:LLM_PROVIDER="gemini"
+  $env:GEMINI_API_KEY="your_gemini_key_here"
+  $env:GEMINI_MODEL="gemini-2.5-flash"
+  $env:TOPIC_LABELING_MODEL="gemini-2.5-flash"
+  $env:SENTIMENT_METHOD="llm"
+  python cli.py analyze --free --input "data/processed/YOUR_FILE_processed.jsonl"
+  python cli.py report
+
+Outputs are written to:
+
+  data/reports/clusters.json
+  data/reports/analysis.json
+  data/reports/structured_output.json
+  data/reports/report.md
+  data/reports/report.html
+  data/reports/clusters.csv
+
+
+LLM Sentiment Mode: Old Behavior
+--------------------------------
+
+PowerShell:
+
+  $env:SENTIMENT_METHOD="llm"
+  python cli.py analyze
+
+This keeps the old LLM sentiment behavior for compatibility.
+
+
+OpenAI Topic Labeling / LLM Fallback
+------------------------------------
+
+PowerShell:
+
+  $env:LLM_PROVIDER="openai"
+  $env:OPENAI_API_KEY="your_openai_key_here"
+  $env:TOPIC_LABELING_MODEL="gpt-4.1-mini"
+  $env:SENTIMENT_METHOD="hybrid"
+  python cli.py analyze
+
+
+Gemini Topic Labeling / LLM Fallback
+------------------------------------
+
+PowerShell:
+
+  $env:LLM_PROVIDER="gemini"
+  $env:GEMINI_API_KEY="your_gemini_key_here"
+  $env:GEMINI_MODEL="gemini-2.5-flash"
+  $env:TOPIC_LABELING_MODEL="gemini-2.5-flash"
+  $env:TOPIC_LABELING_DELAY_SECONDS="30"
+  $env:TOPIC_LABELING_429_COOLDOWN_SECONDS="60"
+  $env:SENTIMENT_METHOD="hybrid"
+  python cli.py analyze
+
+For stricter Gemini free-tier pacing, use:
+
+  $env:TOPIC_LABELING_DELAY_SECONDS="60"
+  $env:TOPIC_LABELING_429_COOLDOWN_SECONDS="90"
+
+
+Useful One-Off Commands
+-----------------------
+
+Show basic package config:
+
+  social-listening --show-config
+
+Run analysis on a specific processed file:
+
+  python cli.py analyze --input data/processed/YOUR_FILE_processed.jsonl
+
+Run report generation from existing JSON outputs:
+
+  python cli.py report --clusters data/reports/clusters.json --analysis data/reports/analysis.json
+
+Export a specific processed file:
+
+  python cli.py export --input data/processed/YOUR_FILE_processed.jsonl
+
+Run the sentiment demo:
+
+  python examples/test_hybrid_sentiment.py
+
+
+Output Files
+------------
+
+Scrape output:
+
+  data/raw/*.jsonl
+
+Preprocess output:
+
+  data/processed/*_processed.jsonl
+
+Analysis output:
+
+  data/reports/clusters.json
+  data/reports/analysis.json
+  data/reports/structured_output.json
+
+Report output:
+
+  data/reports/report.md
+  data/reports/report.html
+  data/reports/clusters.csv
+
+Export output:
+
+  data/reports/<processed_input_name>_inspection.html

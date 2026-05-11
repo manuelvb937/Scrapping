@@ -5,8 +5,12 @@ from unittest.mock import patch, MagicMock
 from analysis.pipeline import run_analysis
 
 
-def test_run_analysis_outputs_valid_json_files(tmp_path: Path) -> None:
+def test_run_analysis_outputs_valid_json_files(tmp_path: Path, monkeypatch) -> None:
     """Test the full analysis pipeline with mocked embedding model."""
+    monkeypatch.setenv("SENTIMENT_METHOD", "llm")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
     input_file = tmp_path / "processed_sample.jsonl"
     records = [
         {"content": "I love this product", "cleaned_content": "I love this product"},
@@ -44,6 +48,8 @@ def test_run_analysis_outputs_valid_json_files(tmp_path: Path) -> None:
 
     for cluster in analysis["clusters"]:
         assert cluster["sentiment"] in {"positive", "negative", "neutral"}
+        assert cluster["dominant_sentiment"] in {"positive", "negative", "neutral"}
         assert isinstance(cluster["topic_label"], str)
         # Per-post sentiment distribution should be present
         assert "sentiment_distribution" in cluster
+        assert "sentiment_counts" in cluster

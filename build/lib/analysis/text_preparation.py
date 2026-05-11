@@ -12,12 +12,10 @@ No hardcoded titles are needed.
 from __future__ import annotations
 
 import logging
-import math
 import re
 import unicodedata
 from collections import Counter
-from functools import lru_cache
-from typing import Mapping, Sequence
+from typing import Sequence
 
 LOGGER = logging.getLogger(__name__)
 
@@ -65,20 +63,6 @@ AT_MENTION = re.compile(r"@\s*\w{1,30}", re.UNICODE)
 
 # Numeric-only noise (retweet count "1", like count, etc.)
 STANDALONE_NUM = re.compile(r"(?<!\w)\d{1,3}(?!\w)")
-
-LATIN_TOKEN = re.compile(r"[a-zA-Z][a-zA-Z0-9_+\-]{1,}")
-JAPANESE_SEQUENCE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff66-\uff9fー]{2,}")
-
-TOPIC_STOPWORDS = {
-    # Japanese particles and common words
-    "の", "に", "は", "を", "が", "で", "と", "も", "た", "て", "し", "な", "い",
-    "いる", "ある", "する", "なる", "です", "ます", "ない", "こと", "もの", "これ",
-    "それ", "あれ", "ここ", "そこ", "さん", "くん", "ちゃん", "って", "けど", "ので",
-    "から", "まで", "より", "よう", "みたい", "そして", "でも", "また", "もう", "まだ",
-    # Common scraped/web noise
-    "amp", "utm", "source", "medium", "search", "yjrealtime", "pic", "https", "http",
-    "www", "com", "co", "jp",
-}
 
 
 def _normalize_fullwidth(text: str) -> str:
@@ -349,168 +333,6 @@ def extract_top_keywords(
                     counter[token] += 1
 
     return counter.most_common(top_n)
-
-
-def extract_cluster_keywords_ctfidf(
-    cluster_texts: Mapping[int, Sequence[str]],
-    *,
-    top_n: int = 10,
-    search_terms: set[str] | None = None,
-    reduce_frequent_words: bool = True,
-) -> dict[int, list[tuple[str, float]]]:
-    """Extract BERTopic-style c-TF-IDF keywords for each cluster.
-
-    Unlike simple per-cluster frequency, c-TF-IDF scores terms by how important
-    they are inside one cluster compared with all other clusters. This makes the
-    keywords better topic descriptors after HDBSCAN has already grouped posts.
-
-    SudachiPy is used for Japanese tokenization when installed. If it is not
-    available, a built-in fallback uses Latin tokens plus Japanese character
-    n-grams, so the pipeline still runs without extra dependencies.
-    """
-    if not cluster_texts:
-        return {}
-
-    search_terms = search_terms or set()
-    class_counts: dict[int, Counter[str]] = {}
-    term_total_frequency: Counter[str] = Counter()
-    class_lengths: dict[int, int] = {}
-
-    for cluster_id, texts in cluster_texts.items():
-        tokens: list[str] = []
-        for text in texts:
-            tokens.extend(tokenize_topic_text(text, search_terms=search_terms))
-        counts = Counter(tokens)
-        class_counts[cluster_id] = counts
-        class_lengths[cluster_id] = sum(counts.values())
-        term_total_frequency.update(counts)
-
-    non_empty_lengths = [length for length in class_lengths.values() if length > 0]
-    avg_class_length = sum(non_empty_lengths) / len(non_empty_lengths) if non_empty_lengths else 1.0
-
-    output: dict[int, list[tuple[str, float]]] = {}
-    for cluster_id, counts in class_counts.items():
-        class_length = class_lengths.get(cluster_id, 0)
-        if class_length <= 0:
-            output[cluster_id] = []
-            continue
-
-        scored_terms: list[tuple[str, float]] = []
-        for term, count in counts.items():
-            tf = count / class_length
-            if reduce_frequent_words:
-                tf = math.sqrt(tf)
-
-            # BERTopic-style class-based IDF. Terms that appear in many classes
-            # get less weight, cluster-specific terms get more weight.
-            total_frequency = term_total_frequency.get(term, 1)
-            idf = math.log(1 + (avg_class_length / total_frequency))
-            score = tf * idf
-            scored_terms.append((term, score))
-
-        scored_terms.sort(key=lambda item: item[1], reverse=True)
-        output[cluster_id] = _diversify_keyword_list(scored_terms, top_n=top_n)
-
-    return output
-
-
-def tokenize_topic_text(text: str, *, search_terms: set[str] | None = None) -> list[str]:
-    """Tokenize text for topic representation with Japanese-aware fallbacks."""
-    normalized = _normalize_fullwidth(str(text or "")).lower()
-    if not normalized.strip():
-        return []
-
-    search_terms = search_terms or set()
-    sudachi_tokens = _tokenize_with_sudachi(normalized)
-    if sudachi_tokens is not None:
-        return [
-            token
-            for token in sudachi_tokens
-            if _keep_topic_token(token, search_terms=search_terms)
-        ]
-
-    tokens: list[str] = []
-    tokens.extend(LATIN_TOKEN.findall(normalized))
-    for sequence in JAPANESE_SEQUENCE.findall(normalized):
-        tokens.extend(_japanese_character_ngrams(sequence))
-
-    return [
-        token
-        for token in tokens
-        if _keep_topic_token(token, search_terms=search_terms)
-    ]
-
-
-def _keep_topic_token(token: str, *, search_terms: set[str]) -> bool:
-    token = token.strip().lower()
-    if len(token) < 2:
-        return False
-    if token in TOPIC_STOPWORDS:
-        return False
-    if token.isdigit():
-        return False
-    return not _is_search_term_token(token, search_terms)
-
-
-def _is_search_term_token(token: str, search_terms: set[str]) -> bool:
-    if not search_terms:
-        return False
-    return any(token == term or token in term or term in token for term in search_terms)
-
-
-def _japanese_character_ngrams(text: str) -> list[str]:
-    compact = re.sub(r"\s+", "", text)
-    if len(compact) <= 6:
-        return [compact]
-
-    ngrams: list[str] = []
-    for n in (2, 3, 4):
-        for i in range(0, len(compact) - n + 1):
-            ngrams.append(compact[i : i + n])
-    return ngrams
-
-
-def _diversify_keyword_list(scored_terms: Sequence[tuple[str, float]], *, top_n: int) -> list[tuple[str, float]]:
-    selected: list[tuple[str, float]] = []
-    for term, score in scored_terms:
-        if any(term in chosen or chosen in term for chosen, _ in selected):
-            continue
-        selected.append((term, round(float(score), 6)))
-        if len(selected) >= top_n:
-            break
-    return selected
-
-
-@lru_cache(maxsize=1)
-def _sudachi_resources():
-    try:
-        from sudachipy import dictionary
-        from sudachipy import tokenizer as sudachi_tokenizer
-    except ImportError:
-        return None
-
-    tokenizer_obj = dictionary.Dictionary().create()
-    return tokenizer_obj, sudachi_tokenizer.Tokenizer.SplitMode.C
-
-
-def _tokenize_with_sudachi(text: str) -> list[str] | None:
-    resources = _sudachi_resources()
-    if resources is None:
-        return None
-
-    tokenizer_obj, split_mode = resources
-    tokens: list[str] = []
-    for morpheme in tokenizer_obj.tokenize(text, split_mode):
-        pos = morpheme.part_of_speech()
-        if not pos:
-            continue
-        if pos[0] not in {"名詞", "動詞", "形容詞"}:
-            continue
-        token = morpheme.normalized_form() or morpheme.dictionary_form() or morpheme.surface()
-        token = token.strip().lower()
-        if token:
-            tokens.append(token)
-    return tokens
 
 
 def select_representative_posts(

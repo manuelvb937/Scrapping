@@ -18,7 +18,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from analysis.pipeline import run_analysis
+from analysis.pipeline import apply_free_mode_defaults, run_analysis
 from collector.yahoo_realtime import scrape_yahoo_realtime, smoke_test_chrome_driver
 from preprocessing.pipeline import preprocess_raw_file
 from reporting.generator import generate_reports
@@ -56,6 +56,9 @@ def command_preprocess(args: argparse.Namespace) -> None:
 
 
 def command_analyze(args: argparse.Namespace) -> None:
+    if args.free:
+        apply_free_mode_defaults()
+
     input_path = Path(args.input) if args.input else latest_file(Path(args.processed_dir), "*.jsonl")
     if input_path is None:
         raise FileNotFoundError(f"No processed JSONL files found in {args.processed_dir}")
@@ -63,6 +66,7 @@ def command_analyze(args: argparse.Namespace) -> None:
     clusters_path, analysis_path = run_analysis(input_path, args.reports_dir)
     print(f"Clusters JSON: {clusters_path}")
     print(f"Analysis JSON: {analysis_path}")
+    print(f"Structured JSON: {Path(args.reports_dir) / 'structured_output.json'}")
 
 
 def command_report(args: argparse.Namespace) -> None:
@@ -111,6 +115,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     analyze = subparsers.add_parser("analyze", help="Analyze latest/processed JSONL")
     analyze.add_argument("--input", default=None, help="Processed JSONL input (defaults to latest in processed dir)")
+    analyze.add_argument(
+        "--free",
+        action="store_true",
+        help="Use conservative LLM batching/delays for free-tier API limits",
+    )
     analyze.set_defaults(func=command_analyze)
 
     report = subparsers.add_parser("report", help="Generate report artifacts")

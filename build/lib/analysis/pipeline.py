@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import time
 from typing import Any
 from datetime import datetime, timezone
@@ -33,48 +32,15 @@ from .sentiment_transformer import (
 from .text_preparation import (
     prepare_clustering_texts,
     extract_top_keywords,
-    extract_cluster_keywords_ctfidf,
     extract_search_term_fragments,
     select_representative_posts,
     clean_for_llm,
 )
 from .topic_labeling import TopicLabeler
-from .structured_output import build_structured_output
 from social_listening_pipeline.config import load_settings
 
 LOGGER = logging.getLogger(__name__)
 SENTIMENT_VALUES = ("positive", "neutral", "negative")
-
-
-FREE_MODE_DEFAULTS = {
-    "SENTIMENT_METHOD": "hybrid",
-    "ENABLE_LLM_SENTIMENT_FALLBACK": "true",
-    "SENTIMENT_CONFIDENCE_THRESHOLD": "0.55",
-    "SENTIMENT_LLM_FALLBACK_BATCH_SIZE": "25",
-    "LLM_SENTIMENT_BATCH_SIZE": "25",
-    "SENTIMENT_LLM_MAX_REVIEWS": "30",
-    "SENTIMENT_LLM_REVIEW_DELAY_SECONDS": "0",
-    "TOPIC_LABELING_DELAY_SECONDS": "0",
-    "TOPIC_LABELING_429_COOLDOWN_SECONDS": "120",
-    "GEMINI_FREE_TIER_LIMITING": "true",
-    "GEMINI_REQUESTS_PER_MINUTE": "10",
-    "GEMINI_TOKENS_PER_MINUTE": "250000",
-    "GEMINI_REQUESTS_PER_DAY": "250",
-    "GEMINI_MIN_SECONDS_BETWEEN_REQUESTS": "6",
-    "GEMINI_THINKING_BUDGET": "0",
-    "LLM_TEMPERATURE": "0",
-}
-
-
-def apply_free_mode_defaults() -> None:
-    """Tune environment defaults for API free tiers.
-
-    The normal mode is unchanged. This helper is called only when the user passes
-    ``--free`` to the CLI. Existing environment values are preserved, so callers
-    can still choose ``SENTIMENT_METHOD=llm`` for a full LLM sentiment run.
-    """
-    for name, value in FREE_MODE_DEFAULTS.items():
-        os.environ.setdefault(name, value)
 
 
 def load_processed_jsonl(path: Path) -> list[dict]:
@@ -103,50 +69,6 @@ def _dominant_sentiment(counts: dict[str, int]) -> str:
     return max(SENTIMENT_VALUES, key=lambda item: (counts.get(item, 0), tie_break[item]))
 
 
-def _match_representative_indices(
-    cluster_indices: list[int],
-    cluster_texts: list[str],
-    representative_texts: list[str],
-) -> set[int]:
-    """Map representative text snippets back to original post indices."""
-    matched: set[int] = set()
-    for representative in representative_texts:
-        for original_index, text in zip(cluster_indices, cluster_texts):
-            if original_index in matched:
-                continue
-            if text[:300] == representative:
-                matched.add(original_index)
-                break
-    return matched
-
-
-def _env_float(name: str, default: float) -> float:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        return float(raw_value)
-    except ValueError:
-        return default
-
-
-def _cluster_clustering_texts(
-    cluster: Cluster,
-    *,
-    clustered_original_indices: set[int],
-    valid_index_positions: dict[int, int],
-    clustering_texts: list[str],
-    all_texts: list[str],
-) -> list[str]:
-    texts: list[str] = []
-    for idx in cluster.indices:
-        if idx in clustered_original_indices and idx in valid_index_positions:
-            texts.append(clustering_texts[valid_index_positions[idx]])
-        else:
-            texts.append(all_texts[idx])
-    return texts
-
-
 def _analyze_post_sentiments(texts: list[str], settings: Any) -> list[dict[str, Any]]:
     """Analyze post sentiment according to SENTIMENT_METHOD.
 
@@ -172,6 +94,7 @@ def _analyze_post_sentiments(texts: list[str], settings: Any) -> list[dict[str, 
                 "transformer_sentiment": None,
                 "llm_review": {
                     "label": sentiment_by_index.get(index, "neutral"),
+                    "rationale": "Legacy LLM sentiment mode.",
                 },
                 "final_sentiment": sentiment_by_index.get(index, "neutral"),
                 "sentiment_source": "llm",
@@ -241,11 +164,6 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
 
     # --- Clustering ---
     clusters, diagnostics = cluster_embeddings(embeddings)
-    coordinates_by_index: dict[int, tuple[float, float]] = {}
-    for embedding_index, coordinate in enumerate(diagnostics.umap_coordinates):
-        if embedding_index >= len(valid_indices) or len(coordinate) < 2:
-            continue
-        coordinates_by_index[valid_indices[embedding_index]] = (coordinate[0], coordinate[1])
 
     # Map cluster indices back to original post indices
     # (clustering was done on valid_indices subset, not all posts)
@@ -285,22 +203,6 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
         sentiment_result_by_index[index] = result
 
     topic_labeler = TopicLabeler(model=settings.topic_labeling_model)
-    valid_index_positions = {idx: pos for pos, idx in enumerate(valid_indices)}
-    cluster_clustering_texts_by_id = {
-        cluster.cluster_id: _cluster_clustering_texts(
-            cluster,
-            clustered_original_indices=clustered_original_indices,
-            valid_index_positions=valid_index_positions,
-            clustering_texts=clustering_texts,
-            all_texts=all_texts,
-        )
-        for cluster in remapped_clusters
-    }
-    ctfidf_keywords_by_cluster = extract_cluster_keywords_ctfidf(
-        cluster_clustering_texts_by_id,
-        top_n=10,
-        search_terms=search_term_stopwords,
-    )
 
     # --- Build output ---
     clusters_payload: list[dict] = []
@@ -308,7 +210,6 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_file": str(input_path),
         "total_posts": len(posts),
-        "structured_output_file": str(output_dir / "structured_output.json"),
         "diagnostics": {
             "cluster_count": diagnostics.cluster_count,
             "cluster_sizes": diagnostics.cluster_sizes,
@@ -316,7 +217,6 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
             "noise_count": diagnostics.noise_count,
             "clustered_posts": len(valid_indices),
             "skipped_posts": len(skipped_indices) if skipped_indices else 0,
-            "coordinate_method": diagnostics.coordinate_method,
             "warning": diagnostics.warning,
         },
         "sentiment_method": settings.sentiment_method,
@@ -328,14 +228,23 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
         "sentiment_confidence_threshold": settings.sentiment_confidence_threshold,
         "clusters": [],
     }
-    representative_indices_by_cluster: dict[int, set[int]] = {}
 
     for cluster in remapped_clusters:
         cluster_posts = [posts[idx] for idx in cluster.indices]
         cluster_texts = [all_texts[idx] for idx in cluster.indices]
 
         # Get clustering_text versions for keyword extraction
-        cluster_clustering_texts = cluster_clustering_texts_by_id.get(cluster.cluster_id, cluster_texts)
+        cluster_clustering_texts = []
+        for idx in cluster.indices:
+            if idx in clustered_original_indices and idx in set(valid_indices):
+                # Find position in valid_indices
+                try:
+                    vi_pos = valid_indices.index(idx)
+                    cluster_clustering_texts.append(clustering_texts[vi_pos])
+                except ValueError:
+                    cluster_clustering_texts.append(all_texts[idx])
+            else:
+                cluster_clustering_texts.append(all_texts[idx])
 
         # Annotate each post with its individual sentiment
         for idx in cluster.indices:
@@ -352,18 +261,10 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
         dominant_sentiment = _dominant_sentiment(sentiment_counts)
 
         # Extract top keywords and representative posts for this cluster
-        top_keywords = ctfidf_keywords_by_cluster.get(cluster.cluster_id)
-        if not top_keywords:
-            top_keywords = extract_top_keywords(
-                cluster_clustering_texts, top_n=10, search_terms=search_term_stopwords,
-            )
-        representative = select_representative_posts(cluster_clustering_texts, limit=5)
-        representative_indices = _match_representative_indices(
-            cluster.indices,
-            cluster_clustering_texts,
-            representative,
+        top_keywords = extract_top_keywords(
+            cluster_clustering_texts, top_n=10, search_terms=search_term_stopwords,
         )
-        representative_indices_by_cluster[cluster.cluster_id] = representative_indices
+        representative = select_representative_posts(cluster_clustering_texts, limit=5)
 
         clusters_payload.append(
             {
@@ -374,22 +275,8 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
                 "sentiment_counts": sentiment_counts,
                 "sentiment_distribution": sentiment_dist,
                 "dominant_sentiment": dominant_sentiment,
-                "topic_representation_method": "ctfidf",
-                "top_keywords": [
-                    {"keyword": kw, "count": score, "score": score}
-                    for kw, score in top_keywords
-                ],
+                "top_keywords": [{"keyword": kw, "count": cnt} for kw, cnt in top_keywords],
                 "representative_posts": representative,
-                "representative_post_indices": sorted(representative_indices),
-                "umap_coordinates": [
-                    {
-                        "post_index": idx,
-                        "x": coordinates_by_index[idx][0],
-                        "y": coordinates_by_index[idx][1],
-                    }
-                    for idx in cluster.indices
-                    if idx in coordinates_by_index
-                ],
             }
         )
 
@@ -415,11 +302,7 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
                 "size": len(cluster.indices),
                 "sentiment_counts": sentiment_counts,
                 "sentiment_distribution": sentiment_dist,
-                "topic_representation_method": "ctfidf",
-                "top_keywords": [
-                    {"keyword": kw, "count": score, "score": score}
-                    for kw, score in top_keywords
-                ],
+                "top_keywords": [{"keyword": kw, "count": cnt} for kw, cnt in top_keywords],
                 "representative_posts": representative,
             }
         )
@@ -429,31 +312,17 @@ def run_analysis(input_path: str | Path, output_dir: str | Path = "data/reports"
             (topic_labeler.provider == "gemini" and topic_labeler.gemini_api_key)
             or (topic_labeler.provider == "openai" and topic_labeler.openai_api_key)
         )
-        extra_topic_delay = _env_float("TOPIC_LABELING_DELAY_SECONDS", 0.0)
-        if has_topic_api and extra_topic_delay > 0:
-            time.sleep(extra_topic_delay)
+        if has_topic_api:
+            time.sleep(10.0)
 
     clusters_path = output_dir / "clusters.json"
     analysis_path = output_dir / "analysis.json"
-    structured_output_path = output_dir / "structured_output.json"
 
     with clusters_path.open("w", encoding="utf-8") as file:
         json.dump({"clusters": clusters_payload}, file, ensure_ascii=False, indent=2)
 
     with analysis_path.open("w", encoding="utf-8") as file:
         json.dump(analysis_payload, file, ensure_ascii=False, indent=2)
-
-    structured_output = build_structured_output(
-        posts=posts,
-        input_path=input_path,
-        clusters_payload=clusters_payload,
-        analysis_payload=analysis_payload,
-        sentiment_results_by_index=sentiment_result_by_index,
-        coordinates_by_index=coordinates_by_index,
-        representative_indices_by_cluster=representative_indices_by_cluster,
-    )
-    with structured_output_path.open("w", encoding="utf-8") as file:
-        json.dump(structured_output, file, ensure_ascii=False, indent=2)
 
     return clusters_path, analysis_path
 
@@ -462,22 +331,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run analysis pipeline on processed JSONL posts.")
     parser.add_argument("--input", required=True, help="Input processed JSONL path.")
     parser.add_argument("--output-dir", default="data/reports", help="Output directory for JSON reports.")
-    parser.add_argument(
-        "--free",
-        action="store_true",
-        help="Use conservative LLM batching/delays for free-tier API limits.",
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.free:
-        apply_free_mode_defaults()
     clusters_path, analysis_path = run_analysis(args.input, args.output_dir)
     print(f"Saved clusters to: {clusters_path}")
     print(f"Saved analysis to: {analysis_path}")
-    print(f"Saved structured output to: {Path(args.output_dir) / 'structured_output.json'}")
 
 
 if __name__ == "__main__":
